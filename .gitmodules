@@ -1,0 +1,3 @@
+[submodule "submodules/Depth-Anything-3"]
+	path = submodules/Depth-Anything-3
+	url = https://github.com/x423xu/Depth-Anything-3.git
