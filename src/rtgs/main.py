@@ -30,11 +30,23 @@ def configure_reproducibility(seed: int) -> None:
 
 
 def build_rtgs_model(cfg: RootConfig) -> RTGSModel:
-    return RTGSModel(RTGSModelConfig(name=cfg.model.name, hidden_channels=cfg.model.hidden_channels))
+    return RTGSModel(
+        RTGSModelConfig(
+            name=cfg.model.name,
+            hidden_channels=cfg.model.hidden_channels,
+            da3_model_name=cfg.model.da3_model_name,
+            da3_process_res=cfg.model.da3_process_res,
+            da3_process_res_method=cfg.model.da3_process_res_method,
+            da3_ref_view_strategy=cfg.model.da3_ref_view_strategy,
+            gaussian_scale_min=cfg.model.gaussian_scale_min,
+            gaussian_scale_max=cfg.model.gaussian_scale_max,
+            sh_degree=cfg.model.sh_degree,
+        )
+    )
 
 
-def build_rtgs_dataset(cfg: RootConfig, stage: DatasetStage = DatasetStage.TEST):
-    dataset_cfg = load_dataset_config(
+def build_rtgs_dataset_config(cfg: RootConfig):
+    return load_dataset_config(
         cfg.dataset.config_path,
         overrides={
             "name": cfg.dataset.name,
@@ -42,27 +54,23 @@ def build_rtgs_dataset(cfg: RootConfig, stage: DatasetStage = DatasetStage.TEST)
             "overfit_to_scene": cfg.dataset.overfit_to_scene,
             "image_shape": cfg.dataset.image_shape,
             "da3_image_shape": cfg.dataset.da3_image_shape,
-            "view_sampler": {
-                "name": "bounded",
-                "num_target_views": 1,
-                "num_context_views": 2,
-                "min_distance_between_context_views": 2,
-                "max_distance_between_context_views": 6,
-                "min_distance_to_context_views": 0,
-                "warm_up_steps": 0,
-                "initial_min_distance_between_context_views": 2,
-                "initial_max_distance_between_context_views": 6,
-            },
+            "view_sampler": cfg.dataset.view_sampler,
         },
     )
+
+
+def build_rtgs_dataset(cfg: RootConfig, stage: DatasetStage = DatasetStage.TEST):
+    dataset_cfg = build_rtgs_dataset_config(cfg)
     sampler = build_view_sampler(dataset_cfg.view_sampler, stage, dataset_cfg.overfit_to_scene is not None, dataset_cfg.cameras_are_circular)
     return build_dataset(dataset_cfg, stage, sampler)
 
 
 def inspect_dataset(cfg: RootConfig) -> None:
+    dataset_cfg = build_rtgs_dataset_config(cfg)
     dataset = build_rtgs_dataset(cfg)
     sample = next(iter(dataset))
     print(f"[RTGS] scene={sample['scene']}")
+    print(f"[RTGS] view_sampler={dataset_cfg.view_sampler}")
     print(f"[RTGS] context_image={tuple(sample['context']['image'].shape)}")
     print(f"[RTGS] context_da3_image={tuple(sample['context']['da3_image'].shape)}")
     print(f"[RTGS] target_image={tuple(sample['target']['image'].shape)}")

@@ -10,6 +10,20 @@ except Exception:  # pragma: no cover
     OmegaConf = None
 
 
+def _default_view_sampler() -> dict[str, Any]:
+    return {
+        "name": "bounded",
+        "num_target_views": 1,
+        "num_context_views": 2,
+        "min_distance_between_context_views": 2,
+        "max_distance_between_context_views": 6,
+        "min_distance_to_context_views": 0,
+        "warm_up_steps": 0,
+        "initial_min_distance_between_context_views": 2,
+        "initial_max_distance_between_context_views": 6,
+    }
+
+
 @dataclass(slots=True)
 class DatasetConfig:
     name: str = "re10k_unposed"
@@ -19,6 +33,7 @@ class DatasetConfig:
     overfit_to_scene: str | None = "5aca87f95a9412c6"
     image_shape: list[int] = field(default_factory=lambda: [256, 256])
     da3_image_shape: list[int] = field(default_factory=lambda: [504, 504])
+    view_sampler: dict[str, Any] = field(default_factory=_default_view_sampler)
     num_workers: int = 0
     seed: int = 111123
 
@@ -27,6 +42,13 @@ class DatasetConfig:
 class ModelConfig:
     name: str = "rtgs_model"
     hidden_channels: int = 16
+    da3_model_name: str = "depth-anything/DA3-SMALL"
+    da3_process_res: int = 504
+    da3_process_res_method: str = "upper_bound_resize"
+    da3_ref_view_strategy: str = "middle"
+    gaussian_scale_min: float = 1.0e-4
+    gaussian_scale_max: float = 1.0e-2
+    sh_degree: int = 0
 
 
 @dataclass(slots=True)

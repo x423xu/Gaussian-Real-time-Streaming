@@ -1,6 +1,8 @@
 defaults:
-  - _self_
+  - dataset: re10k_unposed
   - model: rtgs_model
+  - optional dataset/view_sampler_dataset_specific_config: ${dataset/view_sampler}_${dataset}
+  - _self_
 
 mode: inspect_dataset
 seed: 111123
@@ -18,14 +20,14 @@ dataset:
   seed: 111123
 
 train:
-  steps: 2
-  batch_size: 1
-  lr: 1.0e-3
-  log_every: 1
+  steps: 2000
+  batch_size: 2
+  lr: 1.0e-4
+  log_every: 10
   save_checkpoint: true
 
 runtime:
-  device: cpu
+  device: cuda:1
   conda_env: rtgs
   remote_host: malab
   remote_root: /data0/xxy/code/Gaussian-Real-time-Streaming

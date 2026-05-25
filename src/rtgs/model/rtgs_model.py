@@ -1,26 +1,282 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import sys
+from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
 from torch import Tensor, nn
 import torch.nn.functional as F
+
+
+C0 = 0.28209479177387814
 
 
 @dataclass(slots=True)
 class RTGSModelConfig:
     name: str = "rtgs_model"
     hidden_channels: int = 16
+    da3_model_name: str = "depth-anything/DA3-SMALL"
+    da3_process_res: int = 504
+    da3_process_res_method: str = "upper_bound_resize"
+    da3_ref_view_strategy: str = "middle"
+    gaussian_scale_min: float = 1.0e-4
+    gaussian_scale_max: float = 1.0e-2
+    sh_degree: int = 0
+
+
+class DA3ViewMetaExtractor(nn.Module):
+    """Run DA3 on context images and return GS-resolution depth, intrinsics, and C2W poses."""
+
+    def __init__(
+        self,
+        model_name: str,
+        process_res: int = 504,
+        process_res_method: str = "upper_bound_resize",
+        ref_view_strategy: str = "middle",
+        da3_model: Any | None = None,
+    ) -> None:
+        super().__init__()
+        self.model_name = model_name
+        self.process_res = process_res
+        self.process_res_method = process_res_method
+        self.ref_view_strategy = ref_view_strategy
+        self.da3_model = da3_model if da3_model is not None else self._load_da3_model()
+        if isinstance(self.da3_model, nn.Module):
+            self.da3_model.eval()
+            for parameter in self.da3_model.parameters():
+                parameter.requires_grad_(False)
+
+    def forward(self, context: dict, image: Tensor) -> dict[str, Tensor]:
+        return self._infer_da3(context, image)
+
+    def _load_da3_model(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        da3_src = repo_root / "submodules" / "Depth-Anything-3" / "src"
+        if str(da3_src) not in sys.path:
+            sys.path.insert(0, str(da3_src))
+        from depth_anything_3.api import DepthAnything3
+
+        return DepthAnything3.from_pretrained(self.model_name)
+
+    @torch.no_grad()
+    def _infer_da3(self, context: dict, image: Tensor) -> dict[str, Tensor]:
+        if self.da3_model is None:
+            raise RuntimeError("DA3 is enabled, but no DA3 model is initialized.")
+
+        source_images = context.get("da3_image", image)
+        if source_images.ndim == 4:
+            source_images = source_images.unsqueeze(0)
+        if source_images.ndim != 5:
+            raise ValueError(f"Expected DA3 source image shape (B,V,3,H,W), got {tuple(source_images.shape)}")
+
+        batch, views = image.shape[:2]
+        gs_shape = tuple(image.shape[-2:])
+        all_depths = []
+        all_intrinsics = []
+        all_extrinsics = []
+        for batch_idx in range(batch):
+            pil_images = [self._tensor_to_pil(source_images[batch_idx, view_idx]) for view_idx in range(views)]
+            prediction = self.da3_model.inference(
+                pil_images,
+                process_res=self.process_res,
+                process_res_method=self.process_res_method,
+                ref_view_strategy=self.ref_view_strategy,
+            )
+            depth_da3 = torch.as_tensor(np.asarray(prediction.depth), device=image.device, dtype=image.dtype)
+            intrinsics_da3 = torch.as_tensor(np.asarray(prediction.intrinsics), device=image.device, dtype=image.dtype)
+            extrinsics_c2w = self._da3_extrinsics_to_c2w(
+                torch.as_tensor(np.asarray(prediction.extrinsics), device=image.device, dtype=image.dtype)
+            )
+            source_shape = tuple(depth_da3.shape[-2:])
+            all_depths.append(self._resize_depth(depth_da3, gs_shape))
+            all_intrinsics.append(self._scale_intrinsics(intrinsics_da3, source_shape, gs_shape))
+            all_extrinsics.append(extrinsics_c2w)
+
+        return {
+            "depth": torch.stack(all_depths, dim=0),
+            "intrinsics": torch.stack(all_intrinsics, dim=0),
+            "extrinsics": torch.stack(all_extrinsics, dim=0),
+        }
+
+    def _tensor_to_pil(self, image: Tensor) -> Image.Image:
+        image = image.detach().cpu().clamp(0, 1)
+        array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype("uint8")
+        return Image.fromarray(array, mode="RGB")
+
+    def _resize_depth(self, depth: Tensor, image_shape: tuple[int, int]) -> Tensor:
+        return F.interpolate(depth[:, None], size=image_shape, mode="bilinear", align_corners=False)[:, 0]
+
+    def _scale_intrinsics(self, intrinsics: Tensor, source_shape: tuple[int, int], target_shape: tuple[int, int]) -> Tensor:
+        scaled = intrinsics.clone()
+        scaled[..., 0, :] *= float(target_shape[1]) / float(source_shape[1])
+        scaled[..., 1, :] *= float(target_shape[0]) / float(source_shape[0])
+        return scaled
+
+    def _da3_extrinsics_to_c2w(self, extrinsics: Tensor) -> Tensor:
+        if extrinsics.shape[-2:] == (3, 4):
+            padded = torch.eye(4, device=extrinsics.device, dtype=extrinsics.dtype).repeat(*extrinsics.shape[:-2], 1, 1)
+            padded[..., :3, :4] = extrinsics
+            extrinsics = padded
+        if extrinsics.shape[-2:] != (4, 4):
+            raise ValueError(f"Expected DA3 extrinsics shape (V,3,4) or (V,4,4), got {tuple(extrinsics.shape)}")
+        return torch.linalg.inv(extrinsics)
+
+
+class SimpleGaussianAdapter(nn.Module):
+    """DepthSplat-style adapter from raw per-pixel predictions to world-space Gaussians."""
+
+    def __init__(self, scale_min: float, scale_max: float, sh_degree: int = 0) -> None:
+        super().__init__()
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+        self.sh_degree = sh_degree
+        self.register_buffer("sh_mask", self._build_sh_mask(sh_degree), persistent=False)
+
+    @property
+    def d_sh(self) -> int:
+        return (self.sh_degree + 1) ** 2
+
+    @property
+    def d_in(self) -> int:
+        return 7 + 3 * self.d_sh
+
+    def forward(
+        self,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+        coordinates: Tensor,
+        depths: Tensor,
+        opacities: Tensor,
+        raw_gaussians: Tensor,
+        image_shape: tuple[int, int],
+        input_images: Tensor,
+    ) -> dict[str, Tensor]:
+        scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
+        scales = torch.clamp(F.softplus(scales - 4.0), min=self.scale_min, max=self.scale_max)
+        rotations = rotations / rotations.norm(dim=-1, keepdim=True).clamp_min(1.0e-8)
+
+        sh = sh.reshape(*sh.shape[:-1], 3, self.d_sh) * self.sh_mask
+        image_colors = input_images.permute(0, 1, 3, 4, 2).reshape(*sh.shape[:3], 3)
+        sh[..., 0] = sh[..., 0] + self._rgb_to_sh(image_colors)
+
+        covariances = self._build_covariance(scales, rotations)
+        c2w_rot = extrinsics[..., :3, :3]
+        covariances = c2w_rot.unsqueeze(2) @ covariances @ c2w_rot.unsqueeze(2).transpose(-1, -2)
+        means = self._lift_to_world(coordinates, depths, extrinsics, intrinsics, image_shape)
+
+        batch, views, rays = means.shape[:3]
+        colors = torch.clamp(sh[..., 0] * C0 + 0.5, 0.0, 1.0)
+        return {
+            "means": means.reshape(batch, views * rays, 3),
+            "colors": colors.reshape(batch, views * rays, 3),
+            "opacities": opacities.reshape(batch, views * rays, 1),
+            "covariances": covariances.reshape(batch, views * rays, 3, 3),
+            "harmonics": sh.reshape(batch, views * rays, 3, self.d_sh),
+            "scales": scales.reshape(batch, views * rays, 3),
+            "rotations": rotations.reshape(batch, views * rays, 4),
+        }
+
+    def make_coordinates(self, intrinsics: Tensor, offset_xy: Tensor, image_shape: tuple[int, int]) -> Tensor:
+        height, width = image_shape
+        yy, xx = torch.meshgrid(
+            torch.arange(height, device=offset_xy.device, dtype=offset_xy.dtype),
+            torch.arange(width, device=offset_xy.device, dtype=offset_xy.dtype),
+            indexing="ij",
+        )
+        base = torch.stack((xx, yy), dim=-1).reshape(1, 1, height * width, 2)
+        if self._looks_normalized_intrinsics(intrinsics):
+            base = base / base.new_tensor((max(width - 1, 1), max(height - 1, 1)))
+            pixel_size = base.new_tensor((1.0 / max(width, 1), 1.0 / max(height, 1)))
+        else:
+            pixel_size = base.new_tensor((1.0, 1.0))
+        return base + (offset_xy - 0.5) * pixel_size
+
+    def _lift_to_world(
+        self,
+        coordinates: Tensor,
+        depths: Tensor,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+        image_shape: tuple[int, int],
+    ) -> Tensor:
+        height, width = image_shape
+        xy = coordinates
+        if self._looks_normalized_intrinsics(intrinsics):
+            xy = xy * xy.new_tensor((max(width - 1, 1), max(height - 1, 1)))
+        z = depths
+        fx = intrinsics[..., 0, 0].clamp_min(1.0e-8).unsqueeze(-1)
+        fy = intrinsics[..., 1, 1].clamp_min(1.0e-8).unsqueeze(-1)
+        cx = intrinsics[..., 0, 2].unsqueeze(-1)
+        cy = intrinsics[..., 1, 2].unsqueeze(-1)
+        x = (xy[..., 0] - cx) / fx * z
+        y = (xy[..., 1] - cy) / fy * z
+        points_cam = torch.stack((x, y, z, torch.ones_like(z)), dim=-1)
+        return torch.einsum("bvij,bvrj->bvri", extrinsics, points_cam)[..., :3]
+
+    def _build_covariance(self, scales: Tensor, rotations: Tensor) -> Tensor:
+        scale = scales.diag_embed()
+        rotation = self._quaternion_to_matrix(rotations)
+        return rotation @ scale @ scale.transpose(-1, -2) @ rotation.transpose(-1, -2)
+
+    def _quaternion_to_matrix(self, quaternions: Tensor) -> Tensor:
+        i, j, k, r = torch.unbind(quaternions, dim=-1)
+        two_s = 2.0 / (quaternions.square().sum(dim=-1) + 1.0e-8)
+        matrix = torch.stack(
+            (
+                1 - two_s * (j * j + k * k),
+                two_s * (i * j - k * r),
+                two_s * (i * k + j * r),
+                two_s * (i * j + k * r),
+                1 - two_s * (i * i + k * k),
+                two_s * (j * k - i * r),
+                two_s * (i * k - j * r),
+                two_s * (j * k + i * r),
+                1 - two_s * (i * i + j * j),
+            ),
+            dim=-1,
+        )
+        return matrix.reshape(*quaternions.shape[:-1], 3, 3)
+
+    def _build_sh_mask(self, degree: int) -> Tensor:
+        mask = torch.ones((degree + 1) ** 2, dtype=torch.float32)
+        for current_degree in range(1, degree + 1):
+            mask[current_degree**2 : (current_degree + 1) ** 2] = 0.1 * 0.25**current_degree
+        return mask
+
+    def _rgb_to_sh(self, rgb: Tensor) -> Tensor:
+        return (rgb - 0.5) / C0
+
+    def _looks_normalized_intrinsics(self, intrinsics: Tensor) -> bool:
+        focal = intrinsics[..., (0, 1), (0, 1)].detach().abs().median()
+        center = intrinsics[..., (0, 1), (2, 2)].detach().abs().amax()
+        return bool((focal <= 10.0 and center <= 4.0).cpu().item())
 
 
 class RTGSModel(nn.Module):
-    """Tiny feedforward placeholder: two conv layers from context RGB to RGB + opacity."""
+    """Tiny feedforward GS head orchestrated like DepthSplat: DA3 meta, raw head, adapter."""
 
-    def __init__(self, cfg: RTGSModelConfig | None = None) -> None:
+    def __init__(self, cfg: RTGSModelConfig | None = None, view_meta_extractor: nn.Module | None = None) -> None:
         super().__init__()
         self.cfg = cfg or RTGSModelConfig()
+        self.view_meta_extractor = view_meta_extractor or DA3ViewMetaExtractor(
+            model_name=self.cfg.da3_model_name,
+            process_res=self.cfg.da3_process_res,
+            process_res_method=self.cfg.da3_process_res_method,
+            ref_view_strategy=self.cfg.da3_ref_view_strategy,
+        )
+        self.gaussian_adapter = SimpleGaussianAdapter(
+            scale_min=self.cfg.gaussian_scale_min,
+            scale_max=self.cfg.gaussian_scale_max,
+            sh_degree=self.cfg.sh_degree,
+        )
+
         self.conv1 = nn.Conv2d(3, self.cfg.hidden_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(self.cfg.hidden_channels, 4, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(self.cfg.hidden_channels, 3 + self.gaussian_adapter.d_in, kernel_size=3, padding=1)
+        self.trainable_convolutions = [self.conv1, self.conv2]
 
     def forward(self, batch: dict) -> dict[str, Tensor | dict[str, Tensor]]:
         context = batch["context"]["image"]
@@ -28,23 +284,33 @@ class RTGSModel(nn.Module):
             context = context.unsqueeze(0)
         if context.ndim != 5:
             raise ValueError(f"Expected context image shape (B,V,3,H,W), got {tuple(context.shape)}")
-        features = context.mean(dim=1)
-        raw = self.conv2(F.relu(self.conv1(features)))
-        rgb = torch.sigmoid(raw[:, :3])
-        opacity_map = torch.sigmoid(raw[:, 3:4])
-        return {"rgb": rgb, "gaussians": self._image_proxy_to_gaussians(rgb, opacity_map)}
 
-    def _image_proxy_to_gaussians(self, rgb: Tensor, opacity_map: Tensor) -> dict[str, Tensor]:
-        batch, _, height, width = rgb.shape
-        y, x = torch.meshgrid(
-            torch.linspace(-1.0, 1.0, height, device=rgb.device, dtype=rgb.dtype),
-            torch.linspace(-1.0, 1.0, width, device=rgb.device, dtype=rgb.dtype),
-            indexing="ij",
+        batch_size, views, _, height, width = context.shape
+        view_meta = self.view_meta_extractor(batch["context"], context)
+        intrinsics = view_meta["intrinsics"]
+        c2w = view_meta["extrinsics"]
+        depth = view_meta["depth"]
+
+        features = self.conv1(context.reshape(batch_size * views, 3, height, width))
+        raw = self.conv2(F.relu(features)).reshape(batch_size, views, -1, height, width)
+        raw = raw.permute(0, 1, 3, 4, 2).reshape(batch_size, views, height * width, -1)
+
+        opacities = raw[..., :1].sigmoid()
+        offset_xy = raw[..., 1:3].sigmoid()
+        raw_gaussians = raw[..., 3:]
+        depths = depth.reshape(batch_size, views, height * width)
+        coordinates = self.gaussian_adapter.make_coordinates(intrinsics, offset_xy, (height, width))
+
+        gaussians = self.gaussian_adapter(
+            c2w,
+            intrinsics,
+            coordinates,
+            depths,
+            opacities,
+            raw_gaussians,
+            (height, width),
+            context,
         )
-        z = opacity_map[:, 0]
-        means = torch.stack([x.expand(batch, -1, -1), y.expand(batch, -1, -1), z], dim=-1)
-        return {
-            "means": means.reshape(batch, height * width, 3),
-            "colors": rgb.permute(0, 2, 3, 1).reshape(batch, height * width, 3),
-            "opacities": opacity_map.permute(0, 2, 3, 1).reshape(batch, height * width, 1),
-        }
+        colors_per_view = gaussians["colors"].reshape(batch_size, views, height, width, 3)
+        rgb = colors_per_view.mean(dim=1).permute(0, 3, 1, 2).contiguous()
+        return {"rgb": rgb, "gaussians": gaussians, "view_meta": view_meta}

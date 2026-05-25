@@ -1,2 +1,9 @@
 name: rtgs_model
 hidden_channels: 16
+da3_model_name: depth-anything/DA3-SMALL
+da3_process_res: 504
+da3_process_res_method: upper_bound_resize
+da3_ref_view_strategy: middle
+gaussian_scale_min: 1.0e-4
+gaussian_scale_max: 1.0e-2
+sh_degree: 0
