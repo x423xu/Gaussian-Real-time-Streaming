@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+  - model: rtgs_model
+
+mode: inspect_dataset
+seed: 111123
+output_dir: outputs/rtgs
+
+dataset:
+  name: re10k_unposed
+  roots: [/data0/xxy/data/re10k]
+  split: test
+  config_path: config/dataset/re10k_unposed.yaml
+  overfit_to_scene: 5aca87f95a9412c6
+  image_shape: [256, 256]
+  da3_image_shape: [504, 504]
+  num_workers: 0
+  seed: 111123
+
+train:
+  steps: 2
+  batch_size: 1
+  lr: 1.0e-3
+  log_every: 1
+  save_checkpoint: true
+
+runtime:
+  device: cpu
+  conda_env: rtgs
+  remote_host: malab
+  remote_root: /data0/xxy/code/Gaussian-Real-time-Streaming
