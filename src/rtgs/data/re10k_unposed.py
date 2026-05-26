@@ -18,7 +18,7 @@ class RealEstate10kUnposedDataset(ChunkViewDataset):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gs_image_shape = tuple(self.cfg.image_shape)
-        self.da3_image_shape = tuple(self.cfg.extra.get("da3_image_shape", (504, 504)))
+        self.da3_image_shape = tuple(self.cfg.extra.get("da3_image_shape", (336, 336)))
 
     def _build_example(self, raw: dict):
         scene = raw["key"]

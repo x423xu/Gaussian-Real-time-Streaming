@@ -25,7 +25,7 @@ def load_da3_model(device: str = "cuda", model_name: str = "depth-anything/DA3-S
 def apply_da3_outputs_to_sample(
     sample: dict,
     model,
-    process_res: int = 504,
+    process_res: int = 336,
     process_res_method: str = "upper_bound_resize",
     ref_view_strategy: str = "middle",
 ) -> dict:

@@ -19,12 +19,72 @@ C0 = 0.28209479177387814
 class RTGSModelConfig:
     name: str = "rtgs_model"
     hidden_channels: int = 16
-    da3_model_name: str = "depth-anything/DA3-SMALL"
+    vit_type: str = "vit-b"
+    vit_pretrained: bool = True
+    vit_image_size: int = 252
+    dpt_feature_channels: int = 128
+    da3_model_name: str = "depth-anything/DA3-BASE"
     da3_ref_view_strategy: str = "middle"
     gaussian_scale_min: float = 1.0e-4
     gaussian_scale_max: float = 1.0e-2
     sh_degree: int = 3
     decoder_background_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+def _ensure_da3_src_on_path() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    da3_src = repo_root / "submodules" / "Depth-Anything-3" / "src"
+    if str(da3_src) not in sys.path:
+        sys.path.insert(0, str(da3_src))
+
+
+def _normalize_vit_type(vit_type: str) -> str:
+    aliases = {
+        "s": "vit-s",
+        "small": "vit-s",
+        "vits": "vit-s",
+        "vit_s": "vit-s",
+        "vit-s": "vit-s",
+        "b": "vit-b",
+        "base": "vit-b",
+        "vitb": "vit-b",
+        "vit_b": "vit-b",
+        "vit-b": "vit-b",
+        "l": "vit-l",
+        "large": "vit-l",
+        "vitl": "vit-l",
+        "vit_l": "vit-l",
+        "vit-l": "vit-l",
+    }
+    normalized = aliases.get(vit_type.lower())
+    if normalized is None:
+        raise ValueError(f"Unsupported vit_type {vit_type!r}. Expected vit-s, vit-b, or vit-l.")
+    return normalized
+
+
+def _vit_spec(vit_type: str) -> dict[str, Any]:
+    normalized = _normalize_vit_type(vit_type)
+    specs = {
+        "vit-s": {
+            "timm_name": "vit_small_patch14_dinov2",
+            "embed_dim": 384,
+            "layers": [2, 5, 8, 11],
+            "out_channels": [48, 96, 192, 384],
+        },
+        "vit-b": {
+            "timm_name": "vit_base_patch14_dinov2",
+            "embed_dim": 768,
+            "layers": [5, 7, 9, 11],
+            "out_channels": [96, 192, 384, 768],
+        },
+        "vit-l": {
+            "timm_name": "vit_large_patch14_dinov2",
+            "embed_dim": 1024,
+            "layers": [11, 15, 19, 23],
+            "out_channels": [128, 256, 512, 1024],
+        },
+    }
+    return specs[normalized]
 
 
 class DA3ViewMetaExtractor(nn.Module):
@@ -49,10 +109,7 @@ class DA3ViewMetaExtractor(nn.Module):
         return self._infer_da3(context, image)
 
     def _load_da3_model(self):
-        repo_root = Path(__file__).resolve().parents[3]
-        da3_src = repo_root / "submodules" / "Depth-Anything-3" / "src"
-        if str(da3_src) not in sys.path:
-            sys.path.insert(0, str(da3_src))
+        _ensure_da3_src_on_path()
         from depth_anything_3.api import DepthAnything3
 
         return DepthAnything3.from_pretrained(self.model_name)
@@ -275,14 +332,144 @@ class SimpleGaussianAdapter(nn.Module):
         return bool((focal <= 10.0 and center <= 4.0).cpu().item())
 
 
+class DINOv2FeatureExtractor(nn.Module):
+    """DINOv2 ViT feature extractor with DA3-style intermediate layers."""
+
+    patch_size = 14
+
+    def __init__(self, vit_type: str = "vit-b", pretrained: bool = True, image_size: int = 252) -> None:
+        super().__init__()
+        import timm
+
+        spec = _vit_spec(vit_type)
+        self.vit_type = _normalize_vit_type(vit_type)
+        self.out_layers = list(spec["layers"])
+        self.embed_dim = int(spec["embed_dim"])
+        self.image_size = self._make_patch_aligned_size(image_size)
+        self.backbone = timm.create_model(
+            spec["timm_name"],
+            pretrained=pretrained,
+            img_size=self.image_size,
+        )
+
+    def forward(self, image: Tensor) -> list[Tensor]:
+        if image.ndim != 4:
+            raise ValueError(f"Expected flattened image shape (B*V,3,H,W), got {tuple(image.shape)}")
+        if image.shape[-2:] != (self.image_size, self.image_size):
+            image = F.interpolate(image, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        features = self.backbone.get_intermediate_layers(
+            image,
+            n=self.out_layers,
+            reshape=True,
+            return_prefix_tokens=False,
+            norm=True,
+        )
+        return [feature.contiguous() for feature in features]
+
+    def _make_patch_aligned_size(self, size: int) -> int:
+        aligned = int(size) // self.patch_size * self.patch_size
+        if aligned <= 0:
+            raise ValueError(f"vit_image_size must be at least {self.patch_size}, got {size}")
+        return aligned
+
+
+class RawDPTUpsampler(nn.Module):
+    """DA3-style DPT fusion neck that upsamples ViT features to the image grid."""
+
+    def __init__(
+        self,
+        dim_in: int,
+        features: int,
+        out_channels: list[int],
+    ) -> None:
+        super().__init__()
+        _ensure_da3_src_on_path()
+        from depth_anything_3.model.dpt import _make_fusion_block, _make_scratch
+
+        self.projects = nn.ModuleList([nn.Conv2d(dim_in, channels, kernel_size=1) for channels in out_channels])
+        self.resize_layers = nn.ModuleList(
+            [
+                nn.ConvTranspose2d(out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0),
+                nn.ConvTranspose2d(out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0),
+                nn.Identity(),
+                nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1),
+            ]
+        )
+        self.scratch = _make_scratch(list(out_channels), features, expand=False)
+        self.scratch.refinenet1 = _make_fusion_block(features)
+        self.scratch.refinenet2 = _make_fusion_block(features)
+        self.scratch.refinenet3 = _make_fusion_block(features)
+        self.scratch.refinenet4 = _make_fusion_block(features, has_residual=False)
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(features, features, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(features, features, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+
+    def forward(self, features: list[Tensor], output_shape: tuple[int, int]) -> Tensor:
+        if len(features) != 4:
+            raise ValueError(f"Expected four DINOv2 feature maps, got {len(features)}")
+        resized = []
+        for feature, project, resize in zip(features, self.projects, self.resize_layers):
+            resized.append(resize(project(feature)))
+        fused = self._fuse(resized)
+        fused = self.output_conv(fused)
+        if fused.shape[-2:] != output_shape:
+            fused = F.interpolate(fused, size=output_shape, mode="bilinear", align_corners=True)
+        return fused
+
+    def _fuse(self, features: list[Tensor]) -> Tensor:
+        l1, l2, l3, l4 = features
+        l1_rn = self.scratch.layer1_rn(l1)
+        l2_rn = self.scratch.layer2_rn(l2)
+        l3_rn = self.scratch.layer3_rn(l3)
+        l4_rn = self.scratch.layer4_rn(l4)
+        out = self.scratch.refinenet4(l4_rn, size=l3_rn.shape[2:])
+        out = self.scratch.refinenet3(out, l3_rn, size=l2_rn.shape[2:])
+        out = self.scratch.refinenet2(out, l2_rn, size=l1_rn.shape[2:])
+        return self.scratch.refinenet1(out, l1_rn)
+
+
+class TwinGaussianHead(nn.Module):
+    """Trainable RTGS twin branch: DINOv2 ViT, raw DPT neck, convolutional Gaussian decoder."""
+
+    def __init__(self, cfg: RTGSModelConfig, output_channels: int) -> None:
+        super().__init__()
+        spec = _vit_spec(cfg.vit_type)
+        self.vit = DINOv2FeatureExtractor(
+            vit_type=cfg.vit_type,
+            pretrained=cfg.vit_pretrained,
+            image_size=cfg.vit_image_size,
+        )
+        self.dpt = RawDPTUpsampler(
+            dim_in=int(spec["embed_dim"]),
+            features=cfg.dpt_feature_channels,
+            out_channels=list(spec["out_channels"]),
+        )
+        self.conv_head = nn.Sequential(
+            nn.Conv2d(cfg.dpt_feature_channels + 3, cfg.dpt_feature_channels, kernel_size=3, padding=1, padding_mode="replicate"),
+            nn.GELU(),
+            nn.Conv2d(cfg.dpt_feature_channels, output_channels, kernel_size=3, padding=1, padding_mode="replicate"),
+        )
+        nn.init.zeros_(self.conv_head[-1].weight[:3])
+        nn.init.zeros_(self.conv_head[-1].bias[:3])
+
+    def forward(self, image: Tensor) -> Tensor:
+        features = self.vit(image)
+        dpt_features = self.dpt(features, tuple(image.shape[-2:]))
+        return self.conv_head(torch.cat([dpt_features, image], dim=1))
+
+
 class RTGSModel(nn.Module):
-    """Tiny feedforward GS head orchestrated like DepthSplat: DA3 meta, raw head, adapter."""
+    """Twin feedforward GS model: DA3 view metadata plus DINOv2/DPT Gaussian prediction."""
 
     def __init__(
         self,
         cfg: RTGSModelConfig | None = None,
         view_meta_extractor: nn.Module | None = None,
         decoder: nn.Module | None = None,
+        gaussian_head: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg or RTGSModelConfig()
@@ -299,9 +486,7 @@ class RTGSModel(nn.Module):
             DecoderSplattingCUDACfg(background_color=tuple(self.cfg.decoder_background_color))
         )
 
-        self.conv1 = nn.Conv2d(3, self.cfg.hidden_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(self.cfg.hidden_channels, 3 + self.gaussian_adapter.d_in, kernel_size=3, padding=1)
-        self.trainable_convolutions = [self.conv1, self.conv2]
+        self.gaussian_head = gaussian_head or TwinGaussianHead(self.cfg, 3 + self.gaussian_adapter.d_in)
 
     def forward(self, batch: dict) -> dict[str, Tensor | dict[str, Tensor]]:
         context = batch["context"]["image"]
@@ -325,8 +510,7 @@ class RTGSModel(nn.Module):
         c2w = context_meta["extrinsics"]
         depth = context_meta["depth"]
 
-        features = self.conv1(context.reshape(batch_size * views, 3, height, width))
-        raw = self.conv2(F.relu(features)).reshape(batch_size, views, -1, height, width)
+        raw = self.gaussian_head(context.reshape(batch_size * views, 3, height, width)).reshape(batch_size, views, -1, height, width)
         raw = raw.permute(0, 1, 3, 4, 2).reshape(batch_size, views, height * width, -1)
 
         opacities = raw[..., :1].sigmoid()

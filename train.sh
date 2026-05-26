@@ -1,0 +1,21 @@
+CUDA_VISIBLE_DEVICES=4 PYTHONPATH=src python -m rtgs.main \
+  mode=train_smoke \
+  runtime.device=cuda:0 \
+  dataset.roots=[/data0/xxy/data/re10k] \
+  dataset.overfit_to_scene=null \
+  dataset.da3_image_shape=[336,336] \
+  dataset.num_workers=4 \
+  dataset.persistent_workers=true \
+  dataset.pin_memory=true \
+  dataset.prefetch_factor=4 \
+  train.steps=100000 \
+  train.batch_size=2 \
+  train.lr=1.0e-4 \
+  train.log_every=100 \
+  train.save_checkpoint=true \
+  train.checkpoint_every=5000 \
+  eval.evaluation_index_path=assets/evaluation_index_re10k.json \
+  eval.every_n_steps=2000 \
+  eval.eval_data_interval=10 \
+  eval.max_batches=null \
+  output_dir=outputs/rtgs_100k

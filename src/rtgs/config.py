@@ -32,10 +32,13 @@ class DatasetConfig:
     config_path: str = "config/dataset/re10k_unposed.yaml"
     overfit_to_scene: str | None = "5aca87f95a9412c6"
     image_shape: list[int] = field(default_factory=lambda: [256, 256])
-    da3_image_shape: list[int] = field(default_factory=lambda: [504, 504])
+    da3_image_shape: list[int] = field(default_factory=lambda: [336, 336])
     view_sampler: dict[str, Any] = field(default_factory=_default_view_sampler)
     evaluation_index_path: str | None = None
-    num_workers: int = 0
+    num_workers: int = 4
+    persistent_workers: bool = True
+    pin_memory: bool = True
+    prefetch_factor: int = 4
     seed: int = 111123
 
 
@@ -43,7 +46,11 @@ class DatasetConfig:
 class ModelConfig:
     name: str = "rtgs_model"
     hidden_channels: int = 16
-    da3_model_name: str = "depth-anything/DA3-SMALL"
+    vit_type: str = "vit-b"
+    vit_pretrained: bool = True
+    vit_image_size: int = 252
+    dpt_feature_channels: int = 128
+    da3_model_name: str = "depth-anything/DA3-BASE"
     da3_ref_view_strategy: str = "middle"
     gaussian_scale_min: float = 1.0e-4
     gaussian_scale_max: float = 1.0e-2

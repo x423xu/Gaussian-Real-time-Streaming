@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RTGS Gaussian Playback</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111;
+      color: #eee;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      background: #111;
+    }
+    aside {
+      border-right: 1px solid #2d2d2d;
+      padding: 18px;
+      background: #181818;
+    }
+    main {
+      padding: 18px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 12px;
+      min-width: 0;
+    }
+    label {
+      display: block;
+      margin: 12px 0 6px;
+      color: #bbb;
+      font-size: 13px;
+    }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      background: #0f0f0f;
+      color: #eee;
+      border: 1px solid #383838;
+      border-radius: 6px;
+      padding: 9px;
+      font-size: 13px;
+    }
+    button {
+      border: 1px solid #3b3b3b;
+      border-radius: 6px;
+      background: #252525;
+      color: #eee;
+      padding: 9px 11px;
+      cursor: pointer;
+    }
+    button.primary {
+      background: #e8e0cf;
+      color: #141414;
+      border-color: #e8e0cf;
+      font-weight: 650;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .meta {
+      color: #aaa;
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .viewer {
+      min-height: 0;
+      display: grid;
+      place-items: center;
+      background: #050505;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    img {
+      max-width: 100%;
+      max-height: calc(100vh - 145px);
+      image-rendering: auto;
+    }
+    .timeline {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+    input[type="range"] {
+      padding: 0;
+    }
+    .kbd {
+      display: grid;
+      gap: 5px;
+      color: #aaa;
+      font-size: 12px;
+      margin-top: 14px;
+    }
+    .badge {
+      border: 1px solid #3a3a3a;
+      border-radius: 999px;
+      padding: 4px 8px;
+      color: #ccc;
+      font-size: 12px;
+    }
+    @media (max-width: 820px) {
+      body { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid #2d2d2d; }
+    }
+  </style>
+</head>
+<body>
+  <aside>
+    <h2>RTGS Playback</h2>
+    <label>Scene</label>
+    <input id="scene" value="5aca87f95a9412c6" />
+    <label>Checkpoint path</label>
+    <input id="checkpoint" placeholder="latest twin checkpoint" />
+    <label>Frames to receive</label>
+    <input id="numFrames" type="number" placeholder="full scene" />
+    <div class="row">
+      <div style="flex:1">
+        <label>Gap</label>
+        <input id="gap" type="number" value="4" />
+      </div>
+      <div style="flex:1">
+        <label>Stride</label>
+        <input id="stride" type="number" placeholder="5" />
+      </div>
+    </div>
+    <label>Max snapshots</label>
+    <input id="maxSnapshots" type="number" placeholder="all" />
+    <div class="row">
+      <div style="flex:1">
+        <label>Append mode</label>
+        <button id="appendBtn" aria-pressed="false">Append Off</button>
+      </div>
+      <div style="flex:1">
+        <label>Queue length</label>
+        <input id="appendWindow" type="number" min="1" value="5" />
+      </div>
+    </div>
+    <label>Playback FPS</label>
+    <input id="playbackFps" type="number" min="1" max="60" value="6" />
+    <div class="row" style="margin-top:14px">
+      <button class="primary" id="startBtn">Start</button>
+      <button id="playBtn">Play</button>
+      <button id="resumeBtn">Resume</button>
+      <button id="resetBtn">Reset Pose</button>
+    </div>
+    <div class="kbd">
+      <span>W/S: forward/back or pitch in rotate mode</span>
+      <span>A/D: left/right or yaw in rotate mode</span>
+      <span>Q/E: down/up or roll in rotate mode</span>
+      <span>R: toggle translate/rotate mode</span>
+      <span>J/L: yaw, I/K: pitch, U/O: roll</span>
+    </div>
+    <p id="status" class="meta">Idle.</p>
+  </aside>
+  <main>
+    <div class="row">
+      <span class="badge" id="modeBadge">translate</span>
+      <span class="badge" id="frameBadge">frame 0</span>
+      <span class="badge" id="timestampBadge">timestamp 0</span>
+      <span class="badge" id="cameraBadge">rot 0.000 0.000 0.000</span>
+      <span class="badge" id="queueBadge">queue 1/5</span>
+      <span class="badge" id="fpsBadge">6 fps</span>
+    </div>
+    <div class="viewer">
+      <img id="render" alt="rendered Gaussian snapshot" />
+    </div>
+    <div class="timeline">
+      <input id="timeline" type="range" min="0" max="0" value="0" />
+      <span id="count" class="meta">0 / 0</span>
+    </div>
+  </main>
+  <script>
+    const state = {
+      manifest: null,
+      index: 0,
+      playing: false,
+      mode: "translate",
+      timer: null,
+      renderInFlight: false,
+      renderPending: false,
+      append: false,
+      camera: { tx: 0, ty: 0, tz: 0, rx: 0, ry: 0, rz: 0 },
+    };
+    window.rtgsState = state;
+    const $ = (id) => document.getElementById(id);
+
+    function numberOrNull(value) {
+      if (value === "" || value == null) return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function updateStatus(text) {
+      $("status").textContent = text;
+    }
+
+    function updateCameraBadge() {
+      $("cameraBadge").textContent = `rot ${state.camera.rx.toFixed(3)} ${state.camera.ry.toFixed(3)} ${state.camera.rz.toFixed(3)}`;
+    }
+
+    function appendWindow() {
+      return Math.max(1, numberOrNull($("appendWindow").value) ?? 5);
+    }
+
+    function playbackFps() {
+      return Math.min(60, Math.max(1, numberOrNull($("playbackFps").value) ?? 6));
+    }
+
+    function updatePlaybackFpsBadge() {
+      $("fpsBadge").textContent = `${playbackFps()} fps`;
+    }
+
+    function updateAppendControls(payload = null) {
+      $("appendBtn").textContent = state.append ? "Append On" : "Append Off";
+      $("appendBtn").setAttribute("aria-pressed", state.append ? "true" : "false");
+      const queueSize = payload?.queue_size ?? 1;
+      const windowSize = payload?.append_window ?? appendWindow();
+      const indices = payload?.queue_indices ? ` [${payload.queue_indices.join(",")}]` : "";
+      $("queueBadge").textContent = state.append ? `queue ${queueSize}/${windowSize}${indices}` : "queue 1/1";
+    }
+
+    function manifestStatusText(manifest) {
+      if (!manifest) return "No manifest loaded.";
+      const lines = [manifest.message || manifest.status || "Ready."];
+      if (manifest.scene) lines.push(`scene: ${manifest.scene}`);
+      if (manifest.gaussian_fps_frames != null) lines.push(`snapshots: ${manifest.gaussian_fps_frames}`);
+      if (manifest.num_source_frames != null) lines.push(`source frames: ${manifest.num_source_frames}`);
+      return lines.join("\n");
+    }
+
+    async function applyManifest(manifest) {
+      state.manifest = manifest;
+      if (!manifest || !manifest.gaussian_fps_frames) {
+        updateStatus(manifestStatusText(manifest));
+        return;
+      }
+      state.index = Math.min(state.index, manifest.gaussian_fps_frames - 1);
+      $("timeline").min = 0;
+      $("timeline").max = Math.max(0, manifest.gaussian_fps_frames - 1);
+      $("timeline").value = state.index;
+      updateStatus(manifestStatusText(manifest));
+      await render();
+    }
+
+    async function start() {
+      updateStatus("Generating Gaussian snapshots. This can take a while for the full scene...");
+      const body = {
+        scene: $("scene").value,
+        checkpoint_path: $("checkpoint").value || null,
+        num_frames: numberOrNull($("numFrames").value),
+        gap: numberOrNull($("gap").value) ?? 4,
+        stride: numberOrNull($("stride").value),
+        max_snapshots: numberOrNull($("maxSnapshots").value),
+      };
+      const response = await fetch("/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const manifest = await response.json();
+      state.index = 0;
+      await applyManifest(manifest);
+    }
+
+    async function render() {
+      if (!state.manifest || state.manifest.gaussian_fps_frames === 0) return;
+      if (state.renderInFlight) {
+        state.renderPending = true;
+        return;
+      }
+      state.renderInFlight = true;
+      state.renderPending = false;
+      try {
+        const response = await fetch("/api/render", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            index: state.index,
+            camera: state.camera,
+            append: state.append,
+            append_window: appendWindow(),
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        const payload = await response.json();
+        $("render").src = payload.image;
+        $("frameBadge").textContent = `Gaussian ${payload.index}`;
+        $("timestampBadge").textContent = `source frame ${payload.timestamp}`;
+        $("timeline").value = payload.index;
+        $("count").textContent = `${payload.index + 1} / ${state.manifest.gaussian_fps_frames}`;
+        updateAppendControls(payload);
+      } catch (error) {
+        pause();
+        updateStatus(`Render failed: ${error.message}`);
+      } finally {
+        state.renderInFlight = false;
+        if (state.renderPending) {
+          state.renderPending = false;
+          render();
+        }
+      }
+    }
+
+    function play() {
+      if (!state.manifest) return;
+      if (state.playing) {
+        pause();
+        return;
+      }
+      startPlayback();
+    }
+
+    function pause() {
+      state.playing = false;
+      $("playBtn").textContent = "Play";
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = null;
+    }
+
+    function resume() {
+      if (!state.manifest) return;
+      startPlayback();
+    }
+
+    function startPlayback() {
+      if (!state.manifest || state.manifest.gaussian_fps_frames === 0) return;
+      if (state.timer) clearTimeout(state.timer);
+      state.playing = true;
+      $("playBtn").textContent = "Pause";
+      scheduleNextPlaybackFrame();
+    }
+
+    function scheduleNextPlaybackFrame() {
+      if (!state.playing || !state.manifest) return;
+      const fps = playbackFps();
+      state.timer = setTimeout(async () => {
+        if (!state.playing || !state.manifest) return;
+        if (state.index >= state.manifest.gaussian_fps_frames - 1) {
+          pause();
+          state.index = 0;
+          await render();
+          return;
+        }
+        state.index = state.index + 1;
+        await render();
+        scheduleNextPlaybackFrame();
+      }, 1000 / fps);
+    }
+
+    function resetPose() {
+      state.camera = { tx: 0, ty: 0, tz: 0, rx: 0, ry: 0, rz: 0 };
+      updateCameraBadge();
+      render();
+    }
+
+    function toggleAppend() {
+      state.append = !state.append;
+      updateAppendControls();
+      render();
+    }
+
+    function handleKey(event) {
+      const key = event.key.toLowerCase();
+      if (key === "r") {
+        state.mode = state.mode === "translate" ? "rotate" : "translate";
+        $("modeBadge").textContent = state.mode;
+        return;
+      }
+      const t = 0.03;
+      const r = 0.035;
+      if (key === "j") {
+        state.camera.ry += r;
+      } else if (key === "l") {
+        state.camera.ry -= r;
+      } else if (key === "i") {
+        state.camera.rx += r;
+      } else if (key === "k") {
+        state.camera.rx -= r;
+      } else if (key === "u") {
+        state.camera.rz -= r;
+      } else if (key === "o") {
+        state.camera.rz += r;
+      } else if (state.mode === "translate") {
+        if (key === "w") state.camera.tz += t;
+        else if (key === "s") state.camera.tz -= t;
+        else if (key === "a") state.camera.tx -= t;
+        else if (key === "d") state.camera.tx += t;
+        else if (key === "q") state.camera.ty -= t;
+        else if (key === "e") state.camera.ty += t;
+        else return;
+      } else {
+        if (key === "w") state.camera.rx += r;
+        else if (key === "s") state.camera.rx -= r;
+        else if (key === "a") state.camera.ry += r;
+        else if (key === "d") state.camera.ry -= r;
+        else if (key === "q") state.camera.rz -= r;
+        else if (key === "e") state.camera.rz += r;
+        else return;
+      }
+      event.preventDefault();
+      updateCameraBadge();
+      render();
+    }
+
+    $("startBtn").addEventListener("click", start);
+    $("playBtn").addEventListener("click", play);
+    $("resumeBtn").addEventListener("click", resume);
+    $("resetBtn").addEventListener("click", resetPose);
+    $("appendBtn").addEventListener("click", toggleAppend);
+    function handleAppendWindowChange() {
+      updateAppendControls();
+      render();
+    }
+    $("appendWindow").addEventListener("input", handleAppendWindowChange);
+    $("appendWindow").addEventListener("change", handleAppendWindowChange);
+    $("playbackFps").addEventListener("input", updatePlaybackFpsBadge);
+    $("playbackFps").addEventListener("change", updatePlaybackFpsBadge);
+    $("timeline").addEventListener("input", async (event) => {
+      state.index = Number(event.target.value);
+      await render();
+    });
+    window.addEventListener("keydown", handleKey);
+    updateCameraBadge();
+    updateAppendControls();
+    updatePlaybackFpsBadge();
+    fetch("/api/status").then(r => r.json()).then(payload => applyManifest(payload));
+  </script>
+</body>
+</html>

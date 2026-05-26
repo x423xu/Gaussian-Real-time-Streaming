@@ -6,8 +6,8 @@ roots: [datasets/re10k]
 make_baseline_1: false
 augment: false
 image_shape: [256, 256]
-da3_image_shape: [504, 504]
-da3_process_res: 504
+da3_image_shape: [336, 336]
+da3_process_res: 336
 da3_process_res_method: upper_bound_resize
 da3_model: depth-anything/DA3-SMALL
 da3_device: cuda

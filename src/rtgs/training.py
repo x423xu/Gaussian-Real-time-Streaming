@@ -9,13 +9,13 @@ from torch import nn
 import torch.nn.functional as F
 
 
-def move_to_device(value: Any, device: torch.device):
+def move_to_device(value: Any, device: torch.device, non_blocking: bool = False):
     if torch.is_tensor(value):
-        return value.to(device)
+        return value.to(device, non_blocking=non_blocking)
     if isinstance(value, dict):
-        return {key: move_to_device(item, device) for key, item in value.items()}
+        return {key: move_to_device(item, device, non_blocking=non_blocking) for key, item in value.items()}
     if isinstance(value, list):
-        return [move_to_device(item, device) for item in value]
+        return [move_to_device(item, device, non_blocking=non_blocking) for item in value]
     return value
 
 
@@ -33,33 +33,48 @@ def psnr_from_mse(mse: torch.Tensor) -> torch.Tensor:
     return -10.0 * torch.log10(mse.clamp_min(1.0e-10))
 
 
+def _batch_scene_count(batch: dict) -> int:
+    scenes = batch.get("scene")
+    if isinstance(scenes, (list, tuple)):
+        return len(scenes)
+    if scenes is not None:
+        return 1
+    target = batch.get("target", {}).get("image")
+    if torch.is_tensor(target) and target.ndim >= 5:
+        return int(target.shape[0])
+    return 1
+
+
 @torch.no_grad()
 def evaluate_model(model: nn.Module, loader, device: torch.device, max_batches: int | None = None) -> dict[str, float]:
     was_training = model.training
     model.eval()
     losses: list[torch.Tensor] = []
+    scene_count = 0
     iterator = iter(loader)
     for batch_idx, batch in enumerate(iterator):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        batch = move_to_device(batch, device)
+        scene_count += _batch_scene_count(batch)
+        batch = move_to_device(batch, device, non_blocking=True)
         output = model(batch)
         losses.append(compute_reconstruction_loss(output, batch).detach())
     if was_training:
         model.train()
     if not losses:
-        return {"eval_loss": float("nan"), "eval_psnr": float("nan"), "eval_batches": 0.0}
+        return {"eval_loss": float("nan"), "eval_psnr": float("nan"), "eval_batches": 0.0, "eval_scenes": 0.0}
     mean_loss = torch.stack(losses).mean()
     return {
         "eval_loss": float(mean_loss.cpu().item()),
         "eval_psnr": float(psnr_from_mse(mean_loss).cpu().item()),
         "eval_batches": float(len(losses)),
+        "eval_scenes": float(scene_count),
     }
 
 
 def run_train_step(model: nn.Module, batch: dict, optimizer: torch.optim.Optimizer, device: torch.device) -> dict[str, float]:
     model.train()
-    batch = move_to_device(batch, device)
+    batch = move_to_device(batch, device, non_blocking=True)
     optimizer.zero_grad(set_to_none=True)
     output = model(batch)
     loss = compute_reconstruction_loss(output, batch)
@@ -108,7 +123,7 @@ def run_smoke_training(
             if step % max(1, log_every) == 0 or "eval_psnr" in row:
                 log_file.write(json.dumps(row) + "\n")
                 log_file.flush()
-                eval_text = "" if "eval_psnr" not in row else f" eval_psnr={row['eval_psnr']:.3f}"
+                eval_text = "" if "eval_psnr" not in row else f" eval_psnr={row['eval_psnr']:.3f} eval_scenes={row['eval_scenes']:.0f}"
                 print(f"[RTGS] step={step} loss={row['loss']:.6f}{eval_text}")
     if save_checkpoint:
         save_training_checkpoint(model, metrics, output_dir, "final_checkpoint.pt")

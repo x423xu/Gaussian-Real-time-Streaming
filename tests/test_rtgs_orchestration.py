@@ -11,6 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from rtgs.config import RootConfig, load_typed_root_config
+from rtgs.data.dataloader import build_dataloader
 from rtgs.model.decoder import DecoderOutput
 from rtgs.model.rtgs_model import DA3ViewMetaExtractor, RTGSModel, RTGSModelConfig, SimpleGaussianAdapter
 from rtgs.training import compute_reconstruction_loss, run_train_step
@@ -51,7 +52,52 @@ def test_root_config_accepts_rtgs_defaults() -> None:
     assert cfg.model.name == "rtgs_model"
     assert cfg.model.hidden_channels == 8
     assert cfg.model.sh_degree == 3
+    assert cfg.model.vit_type == "vit-b"
+    assert cfg.model.da3_model_name == "depth-anything/DA3-BASE"
     assert not hasattr(cfg.model, "use_da3")
+    assert cfg.dataset.image_shape == [256, 256]
+    assert cfg.dataset.da3_image_shape == [336, 336]
+    assert cfg.dataset.num_workers > 0
+    assert cfg.dataset.pin_memory is True
+    assert cfg.dataset.persistent_workers is True
+    assert cfg.dataset.prefetch_factor >= 2
+
+
+def test_build_dataloader_enables_streaming_options_when_workers_are_used() -> None:
+    dataset = torch.utils.data.TensorDataset(torch.arange(8))
+
+    loader = build_dataloader(
+        dataset,
+        batch_size=2,
+        num_workers=2,
+        seed=123,
+        persistent_workers=True,
+        pin_memory=True,
+        prefetch_factor=4,
+    )
+
+    assert loader.num_workers == 2
+    assert loader.pin_memory is True
+    assert loader.persistent_workers is True
+    assert loader.prefetch_factor == 4
+
+
+def test_build_dataloader_disables_worker_only_options_without_workers() -> None:
+    dataset = torch.utils.data.TensorDataset(torch.arange(8))
+
+    loader = build_dataloader(
+        dataset,
+        batch_size=2,
+        num_workers=0,
+        persistent_workers=True,
+        pin_memory=True,
+        prefetch_factor=4,
+    )
+
+    assert loader.num_workers == 0
+    assert loader.pin_memory is True
+    assert loader.persistent_workers is False
+    assert loader.prefetch_factor is None
 
 
 class FakeDA3Prediction:
@@ -114,6 +160,26 @@ class FakeDecoder(torch.nn.Module):
         return DecoderOutput(color=color, depth=None)
 
 
+class FakeGaussianHead(torch.nn.Module):
+    def __init__(self, output_channels: int):
+        super().__init__()
+        self.output_channels = output_channels
+        self.calls = []
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        self.calls.append(tuple(image.shape))
+        batch, _, height, width = image.shape
+        raw = image.new_zeros(batch, self.output_channels, height, width)
+        if self.output_channels > 10:
+            raw[:, 10] = self.weight
+        return raw
+
+
+def make_fake_gaussian_head() -> FakeGaussianHead:
+    return FakeGaussianHead(3 + SimpleGaussianAdapter(1e-4, 1e-2, 3).d_in)
+
+
 def test_da3_view_meta_extractor_uses_preprocessed_input_and_scales_to_gs_resolution() -> None:
     fake_da3 = FakeDA3Model()
     extractor = DA3ViewMetaExtractor(
@@ -149,18 +215,22 @@ def test_da3_view_meta_extractor_runs_one_batched_da3_forward() -> None:
     assert meta["extrinsics"].shape == (2, 2, 4, 4)
 
 
-def test_rtgs_model_has_two_trainable_convolutions_and_forward_contract() -> None:
+def test_rtgs_model_uses_twin_vit_dpt_gaussian_head_and_forward_contract() -> None:
     fake_da3 = FakeDA3Model()
     extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=fake_da3)
     decoder = FakeDecoder()
-    model = RTGSModel(RTGSModelConfig(hidden_channels=8), view_meta_extractor=extractor, decoder=decoder)
-    assert [model.conv1, model.conv2] == model.trainable_convolutions
+    model = RTGSModel(RTGSModelConfig(hidden_channels=8), view_meta_extractor=extractor, decoder=decoder, gaussian_head=make_fake_gaussian_head())
+    assert model.cfg.vit_type == "vit-b"
+    assert model.gaussian_head.calls == []
+    assert not hasattr(model, "conv1")
+    assert not hasattr(model, "conv2")
     assert isinstance(model.gaussian_adapter, SimpleGaussianAdapter)
 
     output = model(make_batch())
 
     assert len(fake_da3.forward_calls) == 1
     assert fake_da3.forward_calls[0]["image_shape"] == (1, 5, 3, 32, 32)
+    assert model.gaussian_head.calls == [(2, 3, 16, 16)]
     assert output["rgb"].shape == (1, 3, 16, 16)
     assert output["render"].color.shape == (1, 3, 3, 16, 16)
     assert output["gaussians"]["means"].shape == (1, 2 * 16 * 16, 3)
@@ -177,15 +247,20 @@ def test_rtgs_model_has_two_trainable_convolutions_and_forward_contract() -> Non
     assert decoder.calls[0]["image_shape"] == (16, 16)
 
 
+def test_rtgs_model_maps_vit_type_to_dinov2_and_dpt_config() -> None:
+    cfg = RTGSModelConfig(vit_type="vit-b")
+
+    assert cfg.da3_model_name == "depth-anything/DA3-BASE"
+    assert cfg.vit_type == "vit-b"
+
+
 def test_rtgs_model_lifts_da3_metadata_to_world_gaussian_means() -> None:
     batch = make_batch(batch_size=1, context_views=1, target_views=1, size=2)
     batch["context"]["da3_input"] = torch.rand(1, 1, 3, 2, 2)
     batch["target"]["da3_input"] = torch.rand(1, 1, 3, 2, 2)
     fake_da3 = FakeDA3Model(intrinsics=torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]))
     extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=fake_da3)
-    model = RTGSModel(RTGSModelConfig(hidden_channels=8), view_meta_extractor=extractor, decoder=FakeDecoder())
-    torch.nn.init.zeros_(model.conv2.weight)
-    torch.nn.init.zeros_(model.conv2.bias)
+    model = RTGSModel(RTGSModelConfig(hidden_channels=8), view_meta_extractor=extractor, decoder=FakeDecoder(), gaussian_head=make_fake_gaussian_head())
 
     output = model(batch)
 
@@ -199,7 +274,7 @@ def test_rtgs_model_lifts_da3_metadata_to_world_gaussian_means() -> None:
 
 def test_reconstruction_loss_uses_decoder_rendered_targets() -> None:
     extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=FakeDA3Model())
-    model = RTGSModel(RTGSModelConfig(hidden_channels=8), view_meta_extractor=extractor, decoder=FakeDecoder())
+    model = RTGSModel(RTGSModelConfig(hidden_channels=8), view_meta_extractor=extractor, decoder=FakeDecoder(), gaussian_head=make_fake_gaussian_head())
     batch = make_batch()
     output = model(batch)
     loss = compute_reconstruction_loss(output, batch)
@@ -208,9 +283,42 @@ def test_reconstruction_loss_uses_decoder_rendered_targets() -> None:
     assert torch.allclose(loss, expected)
 
 
+class FakeEvalModel(torch.nn.Module):
+    def forward(self, batch):
+        return {"render": DecoderOutput(color=torch.zeros_like(batch["target"]["image"]), depth=None)}
+
+
+def test_evaluate_model_reports_sampled_scene_count_separately_from_batches() -> None:
+    from rtgs.training import evaluate_model
+
+    loader = [
+        {"target": {"image": torch.zeros(2, 1, 3, 2, 2)}, "scene": ["scene_a", "scene_b"]},
+        {"target": {"image": torch.zeros(1, 1, 3, 2, 2)}, "scene": ["scene_c"]},
+    ]
+
+    metrics = evaluate_model(FakeEvalModel(), loader, torch.device("cpu"))
+
+    assert metrics["eval_batches"] == 2.0
+    assert metrics["eval_scenes"] == 3.0
+
+
+def test_evaluate_model_max_batches_is_only_an_optional_cap() -> None:
+    from rtgs.training import evaluate_model
+
+    loader = [
+        {"target": {"image": torch.zeros(2, 1, 3, 2, 2)}, "scene": ["scene_a", "scene_b"]},
+        {"target": {"image": torch.zeros(1, 1, 3, 2, 2)}, "scene": ["scene_c"]},
+    ]
+
+    metrics = evaluate_model(FakeEvalModel(), loader, torch.device("cpu"), max_batches=1)
+
+    assert metrics["eval_batches"] == 1.0
+    assert metrics["eval_scenes"] == 2.0
+
+
 def test_train_step_updates_rtgs_parameters() -> None:
     extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=FakeDA3Model())
-    model = RTGSModel(RTGSModelConfig(hidden_channels=8), view_meta_extractor=extractor, decoder=FakeDecoder())
+    model = RTGSModel(RTGSModelConfig(hidden_channels=8), view_meta_extractor=extractor, decoder=FakeDecoder(), gaussian_head=make_fake_gaussian_head())
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     before = [parameter.detach().clone() for parameter in model.parameters()]
 
@@ -316,11 +424,18 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
     )
     captured = {}
 
-    def fake_dataset(root_cfg, stage):
+    def fake_dataset(root_cfg, stage, use_evaluation_index=False):
         captured["stage"] = stage
+        captured["use_evaluation_index"] = use_evaluation_index
         return ["dataset"]
 
-    def fake_loader(dataset, batch_size, num_workers, seed):
+    def fake_loader(dataset, batch_size, num_workers, seed, persistent_workers=False, pin_memory=False, prefetch_factor=None):
+        captured["loader_kwargs"] = {
+            "num_workers": num_workers,
+            "persistent_workers": persistent_workers,
+            "pin_memory": pin_memory,
+            "prefetch_factor": prefetch_factor,
+        }
         return ["loader"]
 
     def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None):
@@ -336,6 +451,13 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
     from rtgs.data import DatasetStage
 
     assert captured["stage"] == DatasetStage.TRAIN
+    assert captured["use_evaluation_index"] is False
+    assert captured["loader_kwargs"] == {
+        "num_workers": cfg.dataset.num_workers,
+        "persistent_workers": cfg.dataset.persistent_workers,
+        "pin_memory": cfg.dataset.pin_memory,
+        "prefetch_factor": cfg.dataset.prefetch_factor,
+    }
 
 
 def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatch) -> None:
@@ -360,7 +482,7 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
         dataset_calls.append((stage, use_evaluation_index))
         return f"dataset-{stage}-{use_evaluation_index}"
 
-    def fake_loader(dataset, batch_size, num_workers, seed):
+    def fake_loader(dataset, batch_size, num_workers, seed, persistent_workers=False, pin_memory=False, prefetch_factor=None):
         return f"loader-{dataset}"
 
     def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None):

@@ -34,6 +34,10 @@ def build_rtgs_model(cfg: RootConfig) -> RTGSModel:
         RTGSModelConfig(
             name=cfg.model.name,
             hidden_channels=cfg.model.hidden_channels,
+            vit_type=cfg.model.vit_type,
+            vit_pretrained=cfg.model.vit_pretrained,
+            vit_image_size=cfg.model.vit_image_size,
+            dpt_feature_channels=cfg.model.dpt_feature_channels,
             da3_model_name=cfg.model.da3_model_name,
             da3_ref_view_strategy=cfg.model.da3_ref_view_strategy,
             gaussian_scale_min=cfg.model.gaussian_scale_min,
@@ -82,6 +86,18 @@ def build_rtgs_dataset(cfg: RootConfig, stage: DatasetStage = DatasetStage.TEST,
     return build_dataset(dataset_cfg, stage, sampler)
 
 
+def build_rtgs_dataloader(cfg: RootConfig, stage: DatasetStage = DatasetStage.TEST, use_evaluation_index: bool = False):
+    return build_dataloader(
+        build_rtgs_dataset(cfg, stage, use_evaluation_index=use_evaluation_index),
+        batch_size=cfg.train.batch_size,
+        num_workers=cfg.dataset.num_workers,
+        seed=cfg.dataset.seed,
+        persistent_workers=cfg.dataset.persistent_workers,
+        pin_memory=cfg.dataset.pin_memory,
+        prefetch_factor=cfg.dataset.prefetch_factor,
+    )
+
+
 def inspect_dataset(cfg: RootConfig) -> None:
     dataset_cfg = build_rtgs_dataset_config(cfg)
     dataset = build_rtgs_dataset(cfg)
@@ -98,8 +114,8 @@ def inspect_dataset(cfg: RootConfig) -> None:
 
 def inspect_forward(cfg: RootConfig) -> None:
     device = torch.device(cfg.runtime.device)
-    loader = build_dataloader(build_rtgs_dataset(cfg), batch_size=cfg.train.batch_size, num_workers=cfg.dataset.num_workers, seed=cfg.dataset.seed)
-    batch = move_to_device(next(iter(loader)), device)
+    loader = build_rtgs_dataloader(cfg)
+    batch = move_to_device(next(iter(loader)), device, non_blocking=True)
     model = build_rtgs_model(cfg).to(device).eval()
     with torch.no_grad():
         output = model(batch)
@@ -112,15 +128,10 @@ def inspect_forward(cfg: RootConfig) -> None:
 
 def train_smoke(cfg: RootConfig) -> None:
     device = torch.device(cfg.runtime.device)
-    loader = build_dataloader(build_rtgs_dataset(cfg, DatasetStage.TRAIN), batch_size=cfg.train.batch_size, num_workers=cfg.dataset.num_workers, seed=cfg.dataset.seed)
+    loader = build_rtgs_dataloader(cfg, DatasetStage.TRAIN)
     eval_loader = None
     if evaluation_index_path(cfg) is not None:
-        eval_loader = build_dataloader(
-            build_rtgs_dataset(cfg, DatasetStage.TEST, use_evaluation_index=True),
-            batch_size=cfg.train.batch_size,
-            num_workers=cfg.dataset.num_workers,
-            seed=cfg.dataset.seed,
-        )
+        eval_loader = build_rtgs_dataloader(cfg, DatasetStage.TEST, use_evaluation_index=True)
     metrics = run_smoke_training(
         build_rtgs_model(cfg),
         loader,
@@ -143,12 +154,7 @@ def eval_checkpoint(cfg: RootConfig) -> None:
     if checkpoint_path is None:
         raise ValueError("eval.checkpoint_path must be set for mode=eval.")
     device = torch.device(cfg.runtime.device)
-    loader = build_dataloader(
-        build_rtgs_dataset(cfg, DatasetStage.TEST, use_evaluation_index=evaluation_index_path(cfg) is not None),
-        batch_size=cfg.train.batch_size,
-        num_workers=cfg.dataset.num_workers,
-        seed=cfg.dataset.seed,
-    )
+    loader = build_rtgs_dataloader(cfg, DatasetStage.TEST, use_evaluation_index=evaluation_index_path(cfg) is not None)
     model = build_rtgs_model(cfg).to(device)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(checkpoint["model"], strict=True)

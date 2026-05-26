@@ -13,10 +13,13 @@ dataset:
   roots: [/data0/xxy/data/re10k]
   split: test
   config_path: config/dataset/re10k_unposed.yaml
-  overfit_to_scene: 5aca87f95a9412c6
+  overfit_to_scene: null
   image_shape: [256, 256]
-  da3_image_shape: [504, 504]
-  num_workers: 0
+  da3_image_shape: [336, 336]
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
   seed: 111123
 
 train:
@@ -37,7 +40,7 @@ eval:
   save_rendering_limit: 8
 
 runtime:
-  device: cuda:1
+  device: cuda:2
   conda_env: rtgs
   remote_host: malab
   remote_root: /data0/xxy/code/Gaussian-Real-time-Streaming
