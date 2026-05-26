@@ -44,3 +44,11 @@ runtime:
   conda_env: rtgs
   remote_host: malab
   remote_root: /data0/xxy/code/Gaussian-Real-time-Streaming
+
+wandb:
+  enabled: false
+  entity: xxy
+  project: rtgs
+  name: null
+  mode: online
+  tags: []

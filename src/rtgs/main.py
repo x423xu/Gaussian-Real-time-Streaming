@@ -17,7 +17,7 @@ from rtgs.data import DatasetStage, build_dataset, load_dataset_config
 from rtgs.data.dataloader import build_dataloader
 from rtgs.data.view_sampler import build_view_sampler
 from rtgs.model import RTGSModel, RTGSModelConfig
-from rtgs.training import evaluate_model, move_to_device, run_smoke_training
+from rtgs.training import evaluate_model, init_wandb_run, move_to_device, run_smoke_training
 
 
 def configure_reproducibility(seed: int) -> None:
@@ -132,20 +132,26 @@ def train_smoke(cfg: RootConfig) -> None:
     eval_loader = None
     if evaluation_index_path(cfg) is not None:
         eval_loader = build_rtgs_dataloader(cfg, DatasetStage.TEST, use_evaluation_index=True)
-    metrics = run_smoke_training(
-        build_rtgs_model(cfg),
-        loader,
-        cfg.train.steps,
-        cfg.train.lr,
-        device,
-        Path(cfg.output_dir),
-        cfg.train.log_every,
-        cfg.train.save_checkpoint,
-        cfg.train.checkpoint_every,
-        eval_loader,
-        cfg.eval.every_n_steps,
-        cfg.eval.max_batches,
-    )
+    wandb_logger = init_wandb_run(cfg.wandb, cfg)
+    try:
+        metrics = run_smoke_training(
+            build_rtgs_model(cfg),
+            loader,
+            cfg.train.steps,
+            cfg.train.lr,
+            device,
+            Path(cfg.output_dir),
+            cfg.train.log_every,
+            cfg.train.save_checkpoint,
+            cfg.train.checkpoint_every,
+            eval_loader,
+            cfg.eval.every_n_steps,
+            cfg.eval.max_batches,
+            wandb_logger,
+        )
+    finally:
+        if wandb_logger is not None:
+            wandb_logger.finish()
     print(f"[RTGS] train_smoke_steps={len(metrics)} final_loss={metrics[-1]['loss']:.6f}")
 
 

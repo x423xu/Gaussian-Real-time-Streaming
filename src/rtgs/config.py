@@ -88,6 +88,16 @@ class RuntimeConfig:
 
 
 @dataclass(slots=True)
+class WandbConfig:
+    enabled: bool = False
+    entity: str = "xxy"
+    project: str = "rtgs"
+    name: str | None = None
+    mode: str = "online"
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class RootConfig:
     mode: str = "inspect_dataset"
     seed: int = 111123
@@ -97,6 +107,7 @@ class RootConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
 
 def _to_plain_dict(cfg: Mapping[str, Any] | Any) -> dict[str, Any]:
@@ -121,4 +132,5 @@ def load_typed_root_config(cfg: Mapping[str, Any] | Any) -> RootConfig:
         train=TrainConfig(**_filter_dataclass(TrainConfig, dict(raw.get("train", {})))),
         eval=EvalConfig(**_filter_dataclass(EvalConfig, dict(raw.get("eval", {})))),
         runtime=RuntimeConfig(**_filter_dataclass(RuntimeConfig, dict(raw.get("runtime", {})))),
+        wandb=WandbConfig(**_filter_dataclass(WandbConfig, dict(raw.get("wandb", {})))),
     )

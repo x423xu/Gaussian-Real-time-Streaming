@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=4 PYTHONPATH=src python -m rtgs.main \
+CUDA_VISIBLE_DEVICES=4  DA3_LOG_LEVEL=WARN  PYTHONPATH=src python -m rtgs.main \
   mode=train_smoke \
   runtime.device=cuda:0 \
   dataset.roots=[/data0/xxy/data/re10k] \
@@ -8,6 +8,11 @@ CUDA_VISIBLE_DEVICES=4 PYTHONPATH=src python -m rtgs.main \
   dataset.persistent_workers=true \
   dataset.pin_memory=true \
   dataset.prefetch_factor=4 \
+  model.vit_type=vit-b \
+  model.vit_pretrained=true \
+  model.vit_image_size=252 \
+  model.dpt_feature_channels=128 \
+  model.da3_model_name=depth-anything/DA3-BASE \
   train.steps=100000 \
   train.batch_size=2 \
   train.lr=1.0e-4 \
@@ -18,4 +23,8 @@ CUDA_VISIBLE_DEVICES=4 PYTHONPATH=src python -m rtgs.main \
   eval.every_n_steps=2000 \
   eval.eval_data_interval=10 \
   eval.max_batches=null \
-  output_dir=outputs/rtgs_100k
+  output_dir=outputs/rtgs_vitb \
+  wandb.enabled=true \
+  wandb.entity=xxy \
+  wandb.project=rtgs \
+  wandb.name=rtgs_vitb

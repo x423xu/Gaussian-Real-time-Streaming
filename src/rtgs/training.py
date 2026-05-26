@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import time
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from numbers import Number
 from typing import Any
 
 import torch
@@ -31,6 +34,54 @@ def compute_reconstruction_loss(output: dict, batch: dict) -> torch.Tensor:
 
 def psnr_from_mse(mse: torch.Tensor) -> torch.Tensor:
     return -10.0 * torch.log10(mse.clamp_min(1.0e-10))
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _as_wandb_config(value: Any) -> dict[str, Any]:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def init_wandb_run(wandb_cfg: Any, root_cfg: Any):
+    if not getattr(wandb_cfg, "enabled", False):
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError("wandb.enabled=true, but the wandb package is not installed in this environment.") from exc
+
+    output_dir = Path(getattr(root_cfg, "output_dir", "outputs/rtgs"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return wandb.init(
+        entity=getattr(wandb_cfg, "entity", "xxy"),
+        project=getattr(wandb_cfg, "project", "rtgs"),
+        name=getattr(wandb_cfg, "name", None),
+        mode=getattr(wandb_cfg, "mode", "online"),
+        tags=list(getattr(wandb_cfg, "tags", [])),
+        dir=str(output_dir),
+        config=_as_wandb_config(root_cfg),
+    )
+
+
+def log_row_to_wandb(wandb_logger: Any | None, row: dict[str, Any]) -> None:
+    if wandb_logger is None:
+        return
+    payload = {
+        key: value
+        for key, value in row.items()
+        if key != "step" and isinstance(value, Number) and not isinstance(value, bool)
+    }
+    if payload:
+        wandb_logger.log(payload, step=int(row["step"]))
 
 
 def _batch_scene_count(batch: dict) -> int:
@@ -100,6 +151,7 @@ def run_smoke_training(
     eval_loader=None,
     eval_every: int | None = None,
     eval_max_batches: int | None = None,
+    wandb_logger=None,
 ) -> list[dict[str, float]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     model.to(device)
@@ -107,8 +159,10 @@ def run_smoke_training(
     metrics = []
     iterator = iter(loader)
     log_path = output_dir / "train_metrics.jsonl"
+    start_time = time.perf_counter()
     with log_path.open("w", encoding="utf-8") as log_file:
         for step in range(steps):
+            step_start = time.perf_counter()
             try:
                 batch = next(iterator)
             except StopIteration:
@@ -116,15 +170,40 @@ def run_smoke_training(
                 batch = next(iterator)
             row = {"step": step, **run_train_step(model, batch, optimizer, device)}
             if eval_loader is not None and eval_every is not None and eval_every > 0 and ((step + 1) % eval_every == 0 or step == steps - 1):
+                eval_start = time.perf_counter()
                 row.update(evaluate_model(model, eval_loader, device, eval_max_batches))
+                row["eval_time_s"] = time.perf_counter() - eval_start
             if save_checkpoint and checkpoint_every is not None and checkpoint_every > 0 and (step + 1) % checkpoint_every == 0:
                 save_training_checkpoint(model, metrics + [row], output_dir, f"checkpoint_step_{step + 1:06d}.pt")
+            step_end = time.perf_counter()
+            elapsed_s = step_end - start_time
+            completed_steps = step + 1
+            avg_step_time_s = elapsed_s / max(1, completed_steps)
+            eta_s = avg_step_time_s * max(0, steps - completed_steps)
+            row.update(
+                {
+                    "step_time_s": step_end - step_start,
+                    "avg_step_time_s": avg_step_time_s,
+                    "elapsed_s": elapsed_s,
+                    "eta_s": eta_s,
+                }
+            )
             metrics.append(row)
             if step % max(1, log_every) == 0 or "eval_psnr" in row:
                 log_file.write(json.dumps(row) + "\n")
                 log_file.flush()
+                log_row_to_wandb(wandb_logger, row)
                 eval_text = "" if "eval_psnr" not in row else f" eval_psnr={row['eval_psnr']:.3f} eval_scenes={row['eval_scenes']:.0f}"
-                print(f"[RTGS] step={step} loss={row['loss']:.6f}{eval_text}")
+                if "eval_time_s" in row:
+                    eval_text += f" eval_time={row['eval_time_s']:.1f}s"
+                print(
+                    f"[RTGS] step={step} loss={row['loss']:.6f}{eval_text} "
+                    f"step_time={row['step_time_s']:.2f}s "
+                    f"avg_step={row['avg_step_time_s']:.2f}s "
+                    f"elapsed={format_duration(row['elapsed_s'])} "
+                    f"eta={format_duration(row['eta_s'])}",
+                    flush=True,
+                )
     if save_checkpoint:
         save_training_checkpoint(model, metrics, output_dir, "final_checkpoint.pt")
     return metrics

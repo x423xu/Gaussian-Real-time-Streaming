@@ -14,7 +14,7 @@ from rtgs.config import RootConfig, load_typed_root_config
 from rtgs.data.dataloader import build_dataloader
 from rtgs.model.decoder import DecoderOutput
 from rtgs.model.rtgs_model import DA3ViewMetaExtractor, RTGSModel, RTGSModelConfig, SimpleGaussianAdapter
-from rtgs.training import compute_reconstruction_loss, run_train_step
+from rtgs.training import compute_reconstruction_loss, format_duration, log_row_to_wandb, run_train_step
 
 
 def make_batch(batch_size: int = 1, context_views: int = 2, target_views: int = 3, size: int = 16):
@@ -61,6 +61,9 @@ def test_root_config_accepts_rtgs_defaults() -> None:
     assert cfg.dataset.pin_memory is True
     assert cfg.dataset.persistent_workers is True
     assert cfg.dataset.prefetch_factor >= 2
+    assert cfg.wandb.enabled is False
+    assert cfg.wandb.entity == "xxy"
+    assert cfg.wandb.project == "rtgs"
 
 
 def test_build_dataloader_enables_streaming_options_when_workers_are_used() -> None:
@@ -98,6 +101,36 @@ def test_build_dataloader_disables_worker_only_options_without_workers() -> None
     assert loader.pin_memory is True
     assert loader.persistent_workers is False
     assert loader.prefetch_factor is None
+
+
+def test_format_duration_uses_compact_hms_strings() -> None:
+    assert format_duration(0.42) == "00:00:00"
+    assert format_duration(65.2) == "00:01:05"
+    assert format_duration(3661.9) == "01:01:01"
+
+
+def test_log_row_to_wandb_logs_current_scalar_metrics_at_step() -> None:
+    class FakeWandbRun:
+        def __init__(self):
+            self.calls = []
+
+        def log(self, data, step=None):
+            self.calls.append((data, step))
+
+    run = FakeWandbRun()
+
+    log_row_to_wandb(
+        run,
+        {
+            "step": 7,
+            "loss": 0.1,
+            "eval_psnr": 18.2,
+            "scene": "scene_a",
+            "context_indices": [1, 2],
+        },
+    )
+
+    assert run.calls == [({"loss": 0.1, "eval_psnr": 18.2}, 7)]
 
 
 class FakeDA3Prediction:
@@ -438,7 +471,8 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
         }
         return ["loader"]
 
-    def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None):
+    def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None, wandb_logger=None):
+        captured["wandb_logger"] = wandb_logger
         return [{"loss": 0.0}]
 
     monkeypatch.setattr("rtgs.main.build_rtgs_dataset", fake_dataset)
@@ -458,6 +492,7 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
         "pin_memory": cfg.dataset.pin_memory,
         "prefetch_factor": cfg.dataset.prefetch_factor,
     }
+    assert captured["wandb_logger"] is None
 
 
 def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatch) -> None:
@@ -485,7 +520,7 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
     def fake_loader(dataset, batch_size, num_workers, seed, persistent_workers=False, pin_memory=False, prefetch_factor=None):
         return f"loader-{dataset}"
 
-    def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None):
+    def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None, wandb_logger=None):
         captured.update(
             {
                 "loader": loader,
@@ -493,6 +528,7 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
                 "eval_loader": eval_loader,
                 "eval_every": eval_every,
                 "eval_max_batches": eval_max_batches,
+                "wandb_logger": wandb_logger,
             }
         )
         return [{"loss": 0.0, "eval_psnr": 1.0}]
@@ -509,3 +545,48 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
     assert captured["eval_every"] == 5
     assert captured["eval_max_batches"] == 2
     assert captured["checkpoint_every"] == 5
+    assert captured["wandb_logger"] is None
+
+
+def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
+    from rtgs.main import train_smoke
+
+    cfg = load_typed_root_config(
+        {
+            "runtime": {"device": "cpu"},
+            "wandb": {"enabled": True, "entity": "xxy", "project": "rtgs", "name": "unit-run"},
+            "train": {"steps": 0, "batch_size": 1, "lr": 1e-3, "save_checkpoint": False},
+        }
+    )
+    class FakeRun:
+        def __init__(self):
+            self.finished = False
+
+        def finish(self):
+            self.finished = True
+
+    fake_run = FakeRun()
+    captured = {}
+
+    def fake_init_wandb_run(wandb_cfg, root_cfg):
+        captured["wandb_cfg"] = wandb_cfg
+        captured["root_cfg"] = root_cfg
+        return fake_run
+
+    def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None, wandb_logger=None):
+        captured["wandb_logger"] = wandb_logger
+        return [{"loss": 0.0}]
+
+    monkeypatch.setattr("rtgs.main.build_rtgs_dataset", lambda root_cfg, stage, use_evaluation_index=False: ["dataset"])
+    monkeypatch.setattr("rtgs.main.build_dataloader", lambda *args, **kwargs: ["loader"])
+    monkeypatch.setattr("rtgs.main.build_rtgs_model", lambda root_cfg: torch.nn.Linear(1, 1))
+    monkeypatch.setattr("rtgs.main.init_wandb_run", fake_init_wandb_run)
+    monkeypatch.setattr("rtgs.main.run_smoke_training", fake_training)
+
+    train_smoke(cfg)
+
+    assert captured["wandb_cfg"].enabled is True
+    assert captured["wandb_cfg"].entity == "xxy"
+    assert captured["root_cfg"] is cfg
+    assert captured["wandb_logger"] is fake_run
+    assert fake_run.finished is True
