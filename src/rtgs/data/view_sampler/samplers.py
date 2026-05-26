@@ -170,12 +170,15 @@ class EvaluationSampler(ViewSampler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         with Path(self.cfg["index_path"]).open("r") as handle:
-            self.index = json.load(handle)
+            raw_index = json.load(handle)
+        interval = max(1, int(self.cfg.get("eval_data_interval", 10)))
+        valid_items = [(scene, entry) for scene, entry in raw_index.items() if entry is not None]
+        self.index = {scene: entry for position, (scene, entry) in enumerate(valid_items) if position % interval == 0}
 
     def sample(self, scene: str, extrinsics: Tensor, intrinsics: Tensor, device=torch.device("cpu"), **kwargs):
         entry = self.index.get(scene)
         if entry is None:
-            raise ValueError(f"No indices available for scene {scene}")
+            raise ValueError(f"No evaluation indices available for scene {scene}")
         return (
             torch.tensor(entry["context"], dtype=torch.long, device=device),
             torch.tensor(entry["target"], dtype=torch.long, device=device),

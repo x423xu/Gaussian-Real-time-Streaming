@@ -34,6 +34,7 @@ class DatasetConfig:
     image_shape: list[int] = field(default_factory=lambda: [256, 256])
     da3_image_shape: list[int] = field(default_factory=lambda: [504, 504])
     view_sampler: dict[str, Any] = field(default_factory=_default_view_sampler)
+    evaluation_index_path: str | None = None
     num_workers: int = 0
     seed: int = 111123
 
@@ -43,12 +44,11 @@ class ModelConfig:
     name: str = "rtgs_model"
     hidden_channels: int = 16
     da3_model_name: str = "depth-anything/DA3-SMALL"
-    da3_process_res: int = 504
-    da3_process_res_method: str = "upper_bound_resize"
     da3_ref_view_strategy: str = "middle"
     gaussian_scale_min: float = 1.0e-4
     gaussian_scale_max: float = 1.0e-2
-    sh_degree: int = 0
+    sh_degree: int = 3
+    decoder_background_color: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
 
 @dataclass(slots=True)
@@ -58,6 +58,18 @@ class TrainConfig:
     lr: float = 1e-3
     log_every: int = 1
     save_checkpoint: bool = True
+    checkpoint_every: int | None = None
+
+
+@dataclass(slots=True)
+class EvalConfig:
+    checkpoint_path: str | None = None
+    evaluation_index_path: str | None = None
+    every_n_steps: int = 5000
+    eval_data_interval: int = 10
+    max_batches: int | None = None
+    save_renderings: bool = True
+    save_rendering_limit: int = 8
 
 
 @dataclass(slots=True)
@@ -76,6 +88,7 @@ class RootConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
 
@@ -99,5 +112,6 @@ def load_typed_root_config(cfg: Mapping[str, Any] | Any) -> RootConfig:
         dataset=DatasetConfig(**_filter_dataclass(DatasetConfig, dict(raw.get("dataset", {})))),
         model=ModelConfig(**_filter_dataclass(ModelConfig, dict(raw.get("model", {})))),
         train=TrainConfig(**_filter_dataclass(TrainConfig, dict(raw.get("train", {})))),
+        eval=EvalConfig(**_filter_dataclass(EvalConfig, dict(raw.get("eval", {})))),
         runtime=RuntimeConfig(**_filter_dataclass(RuntimeConfig, dict(raw.get("runtime", {})))),
     )

@@ -12,6 +12,8 @@ from .chunk_dataset import ChunkViewDataset
 
 class RealEstate10kUnposedDataset(ChunkViewDataset):
     default_original_shape = (360, 640)
+    da3_mean = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(3, 1, 1)
+    da3_std = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(3, 1, 1)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -44,22 +46,24 @@ class RealEstate10kUnposedDataset(ChunkViewDataset):
         source_images = [self.decode_image(raw["images"][index.item()]) for index in selected_indices]
         gs_images = torch.stack([self.pil_to_tensor(self.center_crop_resize(image, self.gs_image_shape)) for image in source_images])
         da3_images = torch.stack([self.pil_to_tensor(self.center_crop_resize(image, self.da3_image_shape)) for image in source_images])
+        da3_inputs = self.normalize_da3_images(da3_images)
 
         context_count = len(context_indices)
         context_slice = slice(0, context_count)
         target_slice = slice(context_count, context_count + len(target_indices))
 
         return {
-            "context": self.pack_views(context_indices, gs_images[context_slice], da3_images[context_slice]),
-            "target": self.pack_views(target_indices, gs_images[target_slice], da3_images[target_slice]),
+            "context": self.pack_views(context_indices, gs_images[context_slice], da3_images[context_slice], da3_inputs[context_slice]),
+            "target": self.pack_views(target_indices, gs_images[target_slice], da3_images[target_slice], da3_inputs[target_slice]),
             "scene": scene,
             "all_ind": num_views,
         }
 
-    def pack_views(self, indices: Tensor, image: Tensor, da3_image: Tensor) -> dict:
+    def pack_views(self, indices: Tensor, image: Tensor, da3_image: Tensor, da3_input: Tensor) -> dict:
         return {
             "image": image,
             "da3_image": da3_image,
+            "da3_input": da3_input,
             "near": self.get_bound("near", len(indices)),
             "far": self.get_bound("far", len(indices)),
             "index": indices,
@@ -79,3 +83,6 @@ class RealEstate10kUnposedDataset(ChunkViewDataset):
     def pil_to_tensor(self, image: Image.Image) -> Tensor:
         array = np.asarray(image, dtype=np.float32) / 255.0
         return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+    def normalize_da3_images(self, images: Tensor) -> Tensor:
+        return (images - self.da3_mean) / self.da3_std

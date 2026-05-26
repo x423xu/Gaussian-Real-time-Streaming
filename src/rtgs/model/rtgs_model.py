@@ -5,11 +5,11 @@ from pathlib import Path
 import sys
 from typing import Any
 
-import numpy as np
 import torch
-from PIL import Image
 from torch import Tensor, nn
 import torch.nn.functional as F
+
+from .decoder import DecoderOutput, DecoderSplattingCUDA, DecoderSplattingCUDACfg
 
 
 C0 = 0.28209479177387814
@@ -20,12 +20,11 @@ class RTGSModelConfig:
     name: str = "rtgs_model"
     hidden_channels: int = 16
     da3_model_name: str = "depth-anything/DA3-SMALL"
-    da3_process_res: int = 504
-    da3_process_res_method: str = "upper_bound_resize"
     da3_ref_view_strategy: str = "middle"
     gaussian_scale_min: float = 1.0e-4
     gaussian_scale_max: float = 1.0e-2
-    sh_degree: int = 0
+    sh_degree: int = 3
+    decoder_background_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 class DA3ViewMetaExtractor(nn.Module):
@@ -34,15 +33,11 @@ class DA3ViewMetaExtractor(nn.Module):
     def __init__(
         self,
         model_name: str,
-        process_res: int = 504,
-        process_res_method: str = "upper_bound_resize",
         ref_view_strategy: str = "middle",
         da3_model: Any | None = None,
     ) -> None:
         super().__init__()
         self.model_name = model_name
-        self.process_res = process_res
-        self.process_res_method = process_res_method
         self.ref_view_strategy = ref_view_strategy
         self.da3_model = da3_model if da3_model is not None else self._load_da3_model()
         if isinstance(self.da3_model, nn.Module):
@@ -67,54 +62,78 @@ class DA3ViewMetaExtractor(nn.Module):
         if self.da3_model is None:
             raise RuntimeError("DA3 is enabled, but no DA3 model is initialized.")
 
-        source_images = context.get("da3_image", image)
-        if source_images.ndim == 4:
-            source_images = source_images.unsqueeze(0)
-        if source_images.ndim != 5:
-            raise ValueError(f"Expected DA3 source image shape (B,V,3,H,W), got {tuple(source_images.shape)}")
+        da3_input = context.get("da3_input")
+        if da3_input is None:
+            raise KeyError("Expected context['da3_input'] from the dataloader. DA3 image preprocessing must not run in RTGSModel.")
+        if da3_input.ndim == 4:
+            da3_input = da3_input.unsqueeze(0)
+        if da3_input.ndim != 5:
+            raise ValueError(f"Expected DA3 input shape (B,V,3,H,W), got {tuple(da3_input.shape)}")
 
-        batch, views = image.shape[:2]
+        batch, views = da3_input.shape[:2]
         gs_shape = tuple(image.shape[-2:])
-        all_depths = []
-        all_intrinsics = []
-        all_extrinsics = []
-        for batch_idx in range(batch):
-            pil_images = [self._tensor_to_pil(source_images[batch_idx, view_idx]) for view_idx in range(views)]
-            prediction = self.da3_model.inference(
-                pil_images,
-                process_res=self.process_res,
-                process_res_method=self.process_res_method,
-                ref_view_strategy=self.ref_view_strategy,
-            )
-            depth_da3 = torch.as_tensor(np.asarray(prediction.depth), device=image.device, dtype=image.dtype)
-            intrinsics_da3 = torch.as_tensor(np.asarray(prediction.intrinsics), device=image.device, dtype=image.dtype)
-            extrinsics_c2w = self._da3_extrinsics_to_c2w(
-                torch.as_tensor(np.asarray(prediction.extrinsics), device=image.device, dtype=image.dtype)
-            )
-            source_shape = tuple(depth_da3.shape[-2:])
-            all_depths.append(self._resize_depth(depth_da3, gs_shape))
-            all_intrinsics.append(self._scale_intrinsics(intrinsics_da3, source_shape, gs_shape))
-            all_extrinsics.append(extrinsics_c2w)
+        raw_output = self.da3_model(
+            da3_input,
+            None,
+            None,
+            [],
+            False,
+            False,
+            self.ref_view_strategy,
+        )
+        depth_da3 = self._extract_batched_depth(raw_output, image)
+        intrinsics_da3 = self._extract_batched_intrinsics(raw_output, image, batch, views)
+        extrinsics_c2w = self._da3_extrinsics_to_c2w(self._extract_batched_extrinsics(raw_output, image, batch, views))
+        source_shape = tuple(depth_da3.shape[-2:])
 
         return {
-            "depth": torch.stack(all_depths, dim=0),
-            "intrinsics": torch.stack(all_intrinsics, dim=0),
-            "extrinsics": torch.stack(all_extrinsics, dim=0),
+            "depth": self._resize_depth(depth_da3, gs_shape),
+            "intrinsics": self._scale_intrinsics(intrinsics_da3, source_shape, gs_shape),
+            "extrinsics": extrinsics_c2w,
         }
 
-    def _tensor_to_pil(self, image: Tensor) -> Image.Image:
-        image = image.detach().cpu().clamp(0, 1)
-        array = (image.permute(1, 2, 0).numpy() * 255.0).round().astype("uint8")
-        return Image.fromarray(array, mode="RGB")
-
     def _resize_depth(self, depth: Tensor, image_shape: tuple[int, int]) -> Tensor:
-        return F.interpolate(depth[:, None], size=image_shape, mode="bilinear", align_corners=False)[:, 0]
+        batch, views = depth.shape[:2]
+        return F.interpolate(
+            depth.reshape(batch * views, 1, *depth.shape[-2:]),
+            size=image_shape,
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(batch, views, *image_shape)
 
     def _scale_intrinsics(self, intrinsics: Tensor, source_shape: tuple[int, int], target_shape: tuple[int, int]) -> Tensor:
         scaled = intrinsics.clone()
         scaled[..., 0, :] *= float(target_shape[1]) / float(source_shape[1])
         scaled[..., 1, :] *= float(target_shape[0]) / float(source_shape[0])
         return scaled
+
+    def _extract_batched_depth(self, raw_output: dict[str, Tensor], image: Tensor) -> Tensor:
+        depth = raw_output["depth"].to(device=image.device, dtype=image.dtype)
+        if depth.ndim == 5 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        elif depth.ndim == 5 and depth.shape[2] == 1:
+            depth = depth[:, :, 0]
+        if depth.ndim != 4:
+            raise ValueError(f"Expected batched DA3 depth shape (B,V,H,W), got {tuple(depth.shape)}")
+        return depth
+
+    def _extract_batched_intrinsics(self, raw_output: dict[str, Tensor], image: Tensor, batch: int, views: int) -> Tensor:
+        intrinsics = raw_output.get("intrinsics")
+        if intrinsics is None:
+            raise KeyError("DA3 raw output did not contain intrinsics.")
+        intrinsics = intrinsics.to(device=image.device, dtype=image.dtype)
+        if intrinsics.shape != (batch, views, 3, 3):
+            raise ValueError(f"Expected batched DA3 intrinsics shape {(batch, views, 3, 3)}, got {tuple(intrinsics.shape)}")
+        return intrinsics
+
+    def _extract_batched_extrinsics(self, raw_output: dict[str, Tensor], image: Tensor, batch: int, views: int) -> Tensor:
+        extrinsics = raw_output.get("extrinsics")
+        if extrinsics is None:
+            raise KeyError("DA3 raw output did not contain extrinsics.")
+        extrinsics = extrinsics.to(device=image.device, dtype=image.dtype)
+        if extrinsics.shape[-2:] not in ((3, 4), (4, 4)) or extrinsics.shape[:2] != (batch, views):
+            raise ValueError(f"Expected batched DA3 extrinsics shape (B,V,3,4) or (B,V,4,4), got {tuple(extrinsics.shape)}")
+        return extrinsics
 
     def _da3_extrinsics_to_c2w(self, extrinsics: Tensor) -> Tensor:
         if extrinsics.shape[-2:] == (3, 4):
@@ -259,19 +278,25 @@ class SimpleGaussianAdapter(nn.Module):
 class RTGSModel(nn.Module):
     """Tiny feedforward GS head orchestrated like DepthSplat: DA3 meta, raw head, adapter."""
 
-    def __init__(self, cfg: RTGSModelConfig | None = None, view_meta_extractor: nn.Module | None = None) -> None:
+    def __init__(
+        self,
+        cfg: RTGSModelConfig | None = None,
+        view_meta_extractor: nn.Module | None = None,
+        decoder: nn.Module | None = None,
+    ) -> None:
         super().__init__()
         self.cfg = cfg or RTGSModelConfig()
         self.view_meta_extractor = view_meta_extractor or DA3ViewMetaExtractor(
             model_name=self.cfg.da3_model_name,
-            process_res=self.cfg.da3_process_res,
-            process_res_method=self.cfg.da3_process_res_method,
             ref_view_strategy=self.cfg.da3_ref_view_strategy,
         )
         self.gaussian_adapter = SimpleGaussianAdapter(
             scale_min=self.cfg.gaussian_scale_min,
             scale_max=self.cfg.gaussian_scale_max,
             sh_degree=self.cfg.sh_degree,
+        )
+        self.decoder = decoder or DecoderSplattingCUDA(
+            DecoderSplattingCUDACfg(background_color=tuple(self.cfg.decoder_background_color))
         )
 
         self.conv1 = nn.Conv2d(3, self.cfg.hidden_channels, kernel_size=3, padding=1)
@@ -285,11 +310,20 @@ class RTGSModel(nn.Module):
         if context.ndim != 5:
             raise ValueError(f"Expected context image shape (B,V,3,H,W), got {tuple(context.shape)}")
 
+        target = batch["target"]["image"]
+        if target.ndim == 4:
+            target = target.unsqueeze(0)
+        if target.ndim != 5:
+            raise ValueError(f"Expected target image shape (B,V,3,H,W), got {tuple(target.shape)}")
+
         batch_size, views, _, height, width = context.shape
-        view_meta = self.view_meta_extractor(batch["context"], context)
-        intrinsics = view_meta["intrinsics"]
-        c2w = view_meta["extrinsics"]
-        depth = view_meta["depth"]
+        target_views = target.shape[1]
+        combined_views = self._combine_views_for_da3(batch["context"], batch["target"], context, target)
+        combined_meta = self.view_meta_extractor(combined_views, combined_views["image"])
+        context_meta, target_meta = self._split_view_meta(combined_meta, views)
+        intrinsics = context_meta["intrinsics"]
+        c2w = context_meta["extrinsics"]
+        depth = context_meta["depth"]
 
         features = self.conv1(context.reshape(batch_size * views, 3, height, width))
         raw = self.conv2(F.relu(features)).reshape(batch_size, views, -1, height, width)
@@ -313,4 +347,58 @@ class RTGSModel(nn.Module):
         )
         colors_per_view = gaussians["colors"].reshape(batch_size, views, height, width, 3)
         rgb = colors_per_view.mean(dim=1).permute(0, 3, 1, 2).contiguous()
-        return {"rgb": rgb, "gaussians": gaussians, "view_meta": view_meta}
+        render = self.decoder(
+            gaussians,
+            target_meta["extrinsics"],
+            target_meta["intrinsics"],
+            self._prepare_bounds(batch["target"], "near", batch_size, target_views, context.device, context.dtype, default=0.1),
+            self._prepare_bounds(batch["target"], "far", batch_size, target_views, context.device, context.dtype, default=100.0),
+            (height, width),
+        )
+        return {
+            "rgb": rgb,
+            "render": render,
+            "gaussians": gaussians,
+            "view_meta": context_meta,
+            "context_view_meta": context_meta,
+            "target_view_meta": target_meta,
+        }
+
+    def _combine_views_for_da3(self, context_views: dict, target_views: dict, context_image: Tensor, target_image: Tensor) -> dict[str, Tensor]:
+        context_da3 = context_views.get("da3_input")
+        target_da3 = target_views.get("da3_input")
+        if context_da3 is None or target_da3 is None:
+            raise KeyError("Expected both context['da3_input'] and target['da3_input'] for batched DA3 metadata extraction.")
+        if context_da3.ndim == 4:
+            context_da3 = context_da3.unsqueeze(0)
+        if target_da3.ndim == 4:
+            target_da3 = target_da3.unsqueeze(0)
+        return {
+            "da3_input": torch.cat([context_da3, target_da3], dim=1),
+            "image": torch.cat([context_image, target_image], dim=1),
+        }
+
+    def _split_view_meta(self, meta: dict[str, Tensor], context_views: int) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        context_meta = {key: value[:, :context_views] for key, value in meta.items()}
+        target_meta = {key: value[:, context_views:] for key, value in meta.items()}
+        return context_meta, target_meta
+
+    def _prepare_bounds(
+        self,
+        views: dict,
+        key: str,
+        batch_size: int,
+        num_views: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        default: float,
+    ) -> Tensor:
+        value = views.get(key)
+        if value is None:
+            return torch.full((batch_size, num_views), default, dtype=dtype, device=device)
+        value = value.to(device=device, dtype=dtype)
+        if value.ndim == 1:
+            value = value.unsqueeze(0)
+        if value.shape != (batch_size, num_views):
+            value = value.reshape(batch_size, num_views)
+        return value
