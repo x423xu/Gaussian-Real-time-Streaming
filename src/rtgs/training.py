@@ -11,6 +11,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from .visualization import save_eval_visualizations
+
 
 def move_to_device(value: Any, device: torch.device, non_blocking: bool = False):
     if torch.is_tensor(value):
@@ -84,6 +86,31 @@ def log_row_to_wandb(wandb_logger: Any | None, row: dict[str, Any]) -> None:
         wandb_logger.log(payload, step=int(row["step"]))
 
 
+def log_visualizations_to_wandb(wandb_logger: Any | None, artifacts: dict[str, Path], step: int | None, namespace: str = "eval") -> None:
+    if wandb_logger is None:
+        return
+    try:
+        import wandb
+    except ImportError:
+        return
+    image_suffixes = {".jpg", ".jpeg", ".png"}
+    payload = {
+        f"{namespace}/{name}": wandb.Image(str(path))
+        for name, path in artifacts.items()
+        if path.suffix.lower() in image_suffixes and path.is_file()
+    }
+    if payload:
+        wandb_logger.log(payload, step=step)
+    files = {name: path for name, path in artifacts.items() if path.is_file()}
+    if files and hasattr(wandb_logger, "log_artifact"):
+        step_suffix = "latest" if step is None else f"step-{int(step)}"
+        artifact_name = f"{namespace}-visualizations-{step_suffix}".replace("/", "-")
+        artifact = wandb.Artifact(artifact_name, type="rtgs_eval_visualization")
+        for name, path in files.items():
+            artifact.add_file(str(path), name=f"{name}{path.suffix}")
+        wandb_logger.log_artifact(artifact)
+
+
 def _batch_scene_count(batch: dict) -> int:
     scenes = batch.get("scene")
     if isinstance(scenes, (list, tuple)):
@@ -97,7 +124,18 @@ def _batch_scene_count(batch: dict) -> int:
 
 
 @torch.no_grad()
-def evaluate_model(model: nn.Module, loader, device: torch.device, max_batches: int | None = None) -> dict[str, float]:
+def evaluate_model(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    max_batches: int | None = None,
+    visualization_dir: Path | None = None,
+    visualization_prefix: str = "eval",
+    save_visualizations: bool = False,
+    save_visualization_limit: int = 4,
+    wandb_logger: Any | None = None,
+    wandb_step: int | None = None,
+) -> dict[str, float]:
     was_training = model.training
     model.eval()
     losses: list[torch.Tensor] = []
@@ -110,6 +148,15 @@ def evaluate_model(model: nn.Module, loader, device: torch.device, max_batches: 
         batch = move_to_device(batch, device, non_blocking=True)
         output = model(batch)
         losses.append(compute_reconstruction_loss(output, batch).detach())
+        if save_visualizations and visualization_dir is not None and batch_idx == 0:
+            artifacts = save_eval_visualizations(
+                batch,
+                output,
+                visualization_dir,
+                visualization_prefix,
+                max_target_views=save_visualization_limit,
+            )
+            log_visualizations_to_wandb(wandb_logger, artifacts, wandb_step)
     if was_training:
         model.train()
     if not losses:
@@ -152,6 +199,8 @@ def run_smoke_training(
     eval_every: int | None = None,
     eval_max_batches: int | None = None,
     wandb_logger=None,
+    save_eval_visualizations: bool = False,
+    eval_visualization_limit: int = 4,
 ) -> list[dict[str, float]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     model.to(device)
@@ -171,7 +220,20 @@ def run_smoke_training(
             row = {"step": step, **run_train_step(model, batch, optimizer, device)}
             if eval_loader is not None and eval_every is not None and eval_every > 0 and ((step + 1) % eval_every == 0 or step == steps - 1):
                 eval_start = time.perf_counter()
-                row.update(evaluate_model(model, eval_loader, device, eval_max_batches))
+                row.update(
+                    evaluate_model(
+                        model,
+                        eval_loader,
+                        device,
+                        eval_max_batches,
+                        output_dir / "eval_visualizations",
+                        f"step_{step + 1:06d}",
+                        save_eval_visualizations,
+                        eval_visualization_limit,
+                        wandb_logger,
+                        step,
+                    )
+                )
                 row["eval_time_s"] = time.perf_counter() - eval_start
             if save_checkpoint and checkpoint_every is not None and checkpoint_every > 0 and (step + 1) % checkpoint_every == 0:
                 save_training_checkpoint(model, metrics + [row], output_dir, f"checkpoint_step_{step + 1:06d}.pt")

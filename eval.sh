@@ -1,0 +1,22 @@
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+DA3_LOG_LEVEL=WARN \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=src \
+/data0/xxy/conda_envs/rtgs/bin/python -m rtgs.main \
+  mode=eval \
+  runtime.device=cuda:0 \
+  dataset.roots=[/data0/xxy/data/re10k] \
+  dataset.overfit_to_scene=5aca87f95a9412c6 \
+  dataset.num_workers=0 \
+  dataset.da3_image_shape=[336,336] \
+  model.vit_type=vit-b \
+  model.vit_pretrained=true \
+  model.vit_image_size=252 \
+  model.dpt_feature_channels=128 \
+  model.da3_model_name=depth-anything/DA3-BASE \
+  eval.checkpoint_path=outputs/rtgs_vitb/checkpoint_step_100000.pt \
+  eval.max_batches=1 \
+  eval.save_renderings=true \
+  eval.save_rendering_limit=4 \
+  output_dir=tmp/rtgs_100k_last_eval_visuals

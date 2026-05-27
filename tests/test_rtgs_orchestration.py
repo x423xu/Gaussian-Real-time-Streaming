@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -14,7 +15,8 @@ from rtgs.config import RootConfig, load_typed_root_config
 from rtgs.data.dataloader import build_dataloader
 from rtgs.model.decoder import DecoderOutput
 from rtgs.model.rtgs_model import DA3ViewMetaExtractor, RTGSModel, RTGSModelConfig, SimpleGaussianAdapter
-from rtgs.training import compute_reconstruction_loss, format_duration, log_row_to_wandb, run_train_step
+from rtgs.training import compute_reconstruction_loss, format_duration, log_row_to_wandb, log_visualizations_to_wandb, run_train_step
+from rtgs.visualization import save_eval_visualizations
 
 
 def make_batch(batch_size: int = 1, context_views: int = 2, target_views: int = 3, size: int = 16):
@@ -131,6 +133,85 @@ def test_log_row_to_wandb_logs_current_scalar_metrics_at_step() -> None:
     )
 
     assert run.calls == [({"loss": 0.1, "eval_psnr": 18.2}, 7)]
+
+
+def test_log_visualizations_to_wandb_logs_images_and_file_artifact(tmp_path, monkeypatch) -> None:
+    class FakeImage:
+        def __init__(self, path):
+            self.path = path
+
+    class FakeArtifact:
+        def __init__(self, name, type):
+            self.name = name
+            self.type = type
+            self.files = []
+
+        def add_file(self, path, name=None):
+            self.files.append((path, name))
+
+    class FakeRun:
+        def __init__(self):
+            self.logs = []
+            self.artifacts = []
+
+        def log(self, payload, step=None):
+            self.logs.append((payload, step))
+
+        def log_artifact(self, artifact):
+            self.artifacts.append(artifact)
+
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=FakeImage, Artifact=FakeArtifact))
+    artifacts = {
+        "diagnostic_sheet": tmp_path / "diagnostic.jpg",
+        "gaussian_projection": tmp_path / "gaussian.png",
+        "gaussian_supersplat_ply": tmp_path / "gaussian.ply",
+        "summary": tmp_path / "summary.json",
+    }
+    for path in artifacts.values():
+        path.write_text("unit", encoding="utf-8")
+
+    run = FakeRun()
+    log_visualizations_to_wandb(run, artifacts, step=12, namespace="eval")
+
+    assert set(run.logs[0][0]) == {"eval/diagnostic_sheet", "eval/gaussian_projection"}
+    assert run.logs[0][1] == 12
+    assert run.artifacts[0].name == "eval-visualizations-step-12"
+    assert {name for _, name in run.artifacts[0].files} == {
+        "diagnostic_sheet.jpg",
+        "gaussian_projection.png",
+        "gaussian_supersplat_ply.ply",
+        "summary.json",
+    }
+
+
+def test_save_eval_visualizations_writes_diagnostic_artifacts(tmp_path) -> None:
+    batch = make_batch(batch_size=1, context_views=1, target_views=1, size=4)
+    depth = torch.ones(1, 1, 4, 4)
+    intrinsics = torch.eye(3).reshape(1, 1, 3, 3)
+    extrinsics = torch.eye(4).reshape(1, 1, 4, 4)
+    gaussians = {
+        "means": torch.rand(1, 8, 3),
+        "colors": torch.rand(1, 8, 3),
+        "opacities": torch.full((1, 8, 1), 0.5),
+        "scales": torch.full((1, 8, 3), 0.01),
+        "rotations": torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]).repeat(1, 8, 1),
+        "harmonics": torch.zeros(1, 8, 3, 16),
+        "covariances": torch.eye(3).reshape(1, 1, 3, 3).repeat(1, 8, 1, 1),
+    }
+    output = {
+        "render": DecoderOutput(color=batch["target"]["image"].clone(), depth=None),
+        "gaussians": gaussians,
+        "context_view_meta": {"depth": depth, "intrinsics": intrinsics, "extrinsics": extrinsics},
+        "target_view_meta": {"depth": depth, "intrinsics": intrinsics, "extrinsics": extrinsics},
+    }
+
+    artifacts = save_eval_visualizations(batch, output, tmp_path, "unit", max_target_views=1)
+
+    assert artifacts["diagnostic_sheet"].is_file()
+    assert artifacts["da3_pointmap_projection"].is_file()
+    assert artifacts["gaussian_projection"].is_file()
+    assert artifacts["gaussian_supersplat_ply"].is_file()
+    assert artifacts["summary"].is_file()
 
 
 class FakeDA3Prediction:
@@ -471,8 +552,26 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
         }
         return ["loader"]
 
-    def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None, wandb_logger=None):
+    def fake_training(
+        model,
+        loader,
+        steps,
+        lr,
+        device,
+        output_dir,
+        log_every,
+        save_checkpoint,
+        checkpoint_every=None,
+        eval_loader=None,
+        eval_every=None,
+        eval_max_batches=None,
+        wandb_logger=None,
+        save_eval_visualizations=False,
+        eval_visualization_limit=4,
+    ):
         captured["wandb_logger"] = wandb_logger
+        captured["save_eval_visualizations"] = save_eval_visualizations
+        captured["eval_visualization_limit"] = eval_visualization_limit
         return [{"loss": 0.0}]
 
     monkeypatch.setattr("rtgs.main.build_rtgs_dataset", fake_dataset)
@@ -493,6 +592,8 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
         "prefetch_factor": cfg.dataset.prefetch_factor,
     }
     assert captured["wandb_logger"] is None
+    assert captured["save_eval_visualizations"] == cfg.eval.save_renderings
+    assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
 
 
 def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatch) -> None:
@@ -520,7 +621,23 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
     def fake_loader(dataset, batch_size, num_workers, seed, persistent_workers=False, pin_memory=False, prefetch_factor=None):
         return f"loader-{dataset}"
 
-    def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None, wandb_logger=None):
+    def fake_training(
+        model,
+        loader,
+        steps,
+        lr,
+        device,
+        output_dir,
+        log_every,
+        save_checkpoint,
+        checkpoint_every=None,
+        eval_loader=None,
+        eval_every=None,
+        eval_max_batches=None,
+        wandb_logger=None,
+        save_eval_visualizations=False,
+        eval_visualization_limit=4,
+    ):
         captured.update(
             {
                 "loader": loader,
@@ -529,6 +646,8 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
                 "eval_every": eval_every,
                 "eval_max_batches": eval_max_batches,
                 "wandb_logger": wandb_logger,
+                "save_eval_visualizations": save_eval_visualizations,
+                "eval_visualization_limit": eval_visualization_limit,
             }
         )
         return [{"loss": 0.0, "eval_psnr": 1.0}]
@@ -546,6 +665,8 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
     assert captured["eval_max_batches"] == 2
     assert captured["checkpoint_every"] == 5
     assert captured["wandb_logger"] is None
+    assert captured["save_eval_visualizations"] == cfg.eval.save_renderings
+    assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
 
 
 def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
@@ -573,8 +694,26 @@ def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
         captured["root_cfg"] = root_cfg
         return fake_run
 
-    def fake_training(model, loader, steps, lr, device, output_dir, log_every, save_checkpoint, checkpoint_every=None, eval_loader=None, eval_every=None, eval_max_batches=None, wandb_logger=None):
+    def fake_training(
+        model,
+        loader,
+        steps,
+        lr,
+        device,
+        output_dir,
+        log_every,
+        save_checkpoint,
+        checkpoint_every=None,
+        eval_loader=None,
+        eval_every=None,
+        eval_max_batches=None,
+        wandb_logger=None,
+        save_eval_visualizations=False,
+        eval_visualization_limit=4,
+    ):
         captured["wandb_logger"] = wandb_logger
+        captured["save_eval_visualizations"] = save_eval_visualizations
+        captured["eval_visualization_limit"] = eval_visualization_limit
         return [{"loss": 0.0}]
 
     monkeypatch.setattr("rtgs.main.build_rtgs_dataset", lambda root_cfg, stage, use_evaluation_index=False: ["dataset"])
@@ -589,4 +728,6 @@ def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
     assert captured["wandb_cfg"].entity == "xxy"
     assert captured["root_cfg"] is cfg
     assert captured["wandb_logger"] is fake_run
+    assert captured["save_eval_visualizations"] == cfg.eval.save_renderings
+    assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
     assert fake_run.finished is True
