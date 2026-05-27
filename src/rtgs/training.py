@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -36,6 +37,25 @@ def compute_reconstruction_loss(output: dict, batch: dict) -> torch.Tensor:
 
 def psnr_from_mse(mse: torch.Tensor) -> torch.Tensor:
     return -10.0 * torch.log10(mse.clamp_min(1.0e-10))
+
+
+def cosine_warmup_lr(step: int, total_steps: int, max_lr: float, min_lr: float = 1.0e-8, warmup_steps: int = 4000) -> float:
+    if total_steps <= 0:
+        return float(min_lr)
+    if warmup_steps > 0 and step < warmup_steps:
+        warmup_fraction = float(step + 1) / float(warmup_steps)
+        return float(min_lr + (max_lr - min_lr) * min(1.0, warmup_fraction))
+    if total_steps <= warmup_steps:
+        return float(max_lr)
+    decay_steps = max(1, total_steps - warmup_steps - 1)
+    decay_progress = min(1.0, max(0.0, float(step - warmup_steps) / float(decay_steps)))
+    cosine = 0.5 * (1.0 + math.cos(decay_progress * math.pi))
+    return float(min_lr + (max_lr - min_lr) * cosine)
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
 
 def format_duration(seconds: float) -> str:
@@ -201,10 +221,12 @@ def run_smoke_training(
     wandb_logger=None,
     save_eval_visualizations: bool = False,
     eval_visualization_limit: int = 4,
+    min_lr: float = 1.0e-8,
+    warmup_steps: int = 4000,
 ) -> list[dict[str, float]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=min_lr)
     metrics = []
     iterator = iter(loader)
     log_path = output_dir / "train_metrics.jsonl"
@@ -217,7 +239,9 @@ def run_smoke_training(
             except StopIteration:
                 iterator = iter(loader)
                 batch = next(iterator)
-            row = {"step": step, **run_train_step(model, batch, optimizer, device)}
+            current_lr = cosine_warmup_lr(step, steps, lr, min_lr, warmup_steps)
+            set_optimizer_lr(optimizer, current_lr)
+            row = {"step": step, "lr": current_lr, **run_train_step(model, batch, optimizer, device)}
             if eval_loader is not None and eval_every is not None and eval_every > 0 and ((step + 1) % eval_every == 0 or step == steps - 1):
                 eval_start = time.perf_counter()
                 row.update(
@@ -259,7 +283,7 @@ def run_smoke_training(
                 if "eval_time_s" in row:
                     eval_text += f" eval_time={row['eval_time_s']:.1f}s"
                 print(
-                    f"[RTGS] step={step} loss={row['loss']:.6f}{eval_text} "
+                    f"[RTGS] step={step} loss={row['loss']:.6f} lr={row['lr']:.3e}{eval_text} "
                     f"step_time={row['step_time_s']:.2f}s "
                     f"avg_step={row['avg_step_time_s']:.2f}s "
                     f"elapsed={format_duration(row['elapsed_s'])} "

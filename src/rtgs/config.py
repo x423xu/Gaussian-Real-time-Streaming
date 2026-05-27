@@ -63,6 +63,8 @@ class TrainConfig:
     steps: int = 2
     batch_size: int = 1
     lr: float = 1e-3
+    min_lr: float = 1e-8
+    warmup_steps: int = 4000
     log_every: int = 1
     save_checkpoint: bool = True
     checkpoint_every: int | None = None

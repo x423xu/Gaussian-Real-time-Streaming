@@ -452,8 +452,8 @@ class TwinGaussianHead(nn.Module):
             nn.GELU(),
             nn.Conv2d(cfg.dpt_feature_channels, output_channels, kernel_size=3, padding=1, padding_mode="replicate"),
         )
-        nn.init.zeros_(self.conv_head[-1].weight[:3])
-        nn.init.zeros_(self.conv_head[-1].bias[:3])
+        # nn.init.zeros_(self.conv_head[-1].weight[:3])
+        # nn.init.zeros_(self.conv_head[-1].bias[:3])
 
     def forward(self, image: Tensor) -> Tensor:
         features = self.vit(image)

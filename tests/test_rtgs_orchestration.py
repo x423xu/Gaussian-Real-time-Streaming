@@ -15,7 +15,15 @@ from rtgs.config import RootConfig, load_typed_root_config
 from rtgs.data.dataloader import build_dataloader
 from rtgs.model.decoder import DecoderOutput
 from rtgs.model.rtgs_model import DA3ViewMetaExtractor, RTGSModel, RTGSModelConfig, SimpleGaussianAdapter
-from rtgs.training import compute_reconstruction_loss, format_duration, log_row_to_wandb, log_visualizations_to_wandb, run_train_step
+from rtgs.training import (
+    compute_reconstruction_loss,
+    cosine_warmup_lr,
+    format_duration,
+    log_row_to_wandb,
+    log_visualizations_to_wandb,
+    run_smoke_training,
+    run_train_step,
+)
 from rtgs.visualization import save_eval_visualizations
 
 
@@ -133,6 +141,68 @@ def test_log_row_to_wandb_logs_current_scalar_metrics_at_step() -> None:
     )
 
     assert run.calls == [({"loss": 0.1, "eval_psnr": 18.2}, 7)]
+
+
+def test_cosine_warmup_lr_uses_configured_lr_as_peak_and_decays_to_min_lr() -> None:
+    values = [
+        cosine_warmup_lr(step, total_steps=10, max_lr=1.0e-3, min_lr=1.0e-8, warmup_steps=4)
+        for step in range(10)
+    ]
+
+    assert values[0] > 1.0e-8
+    assert values[0] < values[1] < values[2] < values[3]
+    assert values[3] == 1.0e-3
+    assert values[4] == 1.0e-3
+    assert values[-1] == 1.0e-8
+    assert all(1.0e-8 <= value <= 1.0e-3 for value in values)
+
+
+def test_run_smoke_training_logs_scheduled_learning_rate(tmp_path) -> None:
+    class TinyDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            return {"x": torch.tensor([[float(index) + 1.0]]), "y": torch.tensor([[0.0]])}
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1, 1))
+
+        def forward(self, batch):
+            pred = batch["x"] @ self.weight
+            return {"render": DecoderOutput(color=pred.reshape(1, 1, 1, 1, 1), depth=None)}
+
+    def tiny_loss(output, batch):
+        target = batch["y"].reshape(1, 1, 1, 1, 1)
+        return torch.nn.functional.mse_loss(output["render"].color, target)
+
+    import rtgs.training as training
+
+    original_loss = training.compute_reconstruction_loss
+    training.compute_reconstruction_loss = tiny_loss
+    try:
+        metrics = run_smoke_training(
+            TinyModel(),
+            torch.utils.data.DataLoader(TinyDataset(), batch_size=1),
+            steps=3,
+            lr=1.0e-3,
+            min_lr=1.0e-5,
+            warmup_steps=2,
+            device=torch.device("cpu"),
+            output_dir=tmp_path,
+            log_every=1,
+            save_checkpoint=False,
+        )
+    finally:
+        training.compute_reconstruction_loss = original_loss
+
+    assert [row["lr"] for row in metrics] == [
+        cosine_warmup_lr(0, 3, 1.0e-3, 1.0e-5, 2),
+        cosine_warmup_lr(1, 3, 1.0e-3, 1.0e-5, 2),
+        cosine_warmup_lr(2, 3, 1.0e-3, 1.0e-5, 2),
+    ]
 
 
 def test_log_visualizations_to_wandb_logs_images_and_file_artifact(tmp_path, monkeypatch) -> None:
@@ -568,10 +638,14 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
         wandb_logger=None,
         save_eval_visualizations=False,
         eval_visualization_limit=4,
+        min_lr=1.0e-8,
+        warmup_steps=4000,
     ):
         captured["wandb_logger"] = wandb_logger
         captured["save_eval_visualizations"] = save_eval_visualizations
         captured["eval_visualization_limit"] = eval_visualization_limit
+        captured["min_lr"] = min_lr
+        captured["warmup_steps"] = warmup_steps
         return [{"loss": 0.0}]
 
     monkeypatch.setattr("rtgs.main.build_rtgs_dataset", fake_dataset)
@@ -594,6 +668,8 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
     assert captured["wandb_logger"] is None
     assert captured["save_eval_visualizations"] == cfg.eval.save_renderings
     assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
+    assert captured["min_lr"] == cfg.train.min_lr
+    assert captured["warmup_steps"] == cfg.train.warmup_steps
 
 
 def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatch) -> None:
@@ -637,6 +713,8 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
         wandb_logger=None,
         save_eval_visualizations=False,
         eval_visualization_limit=4,
+        min_lr=1.0e-8,
+        warmup_steps=4000,
     ):
         captured.update(
             {
@@ -648,6 +726,8 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
                 "wandb_logger": wandb_logger,
                 "save_eval_visualizations": save_eval_visualizations,
                 "eval_visualization_limit": eval_visualization_limit,
+                "min_lr": min_lr,
+                "warmup_steps": warmup_steps,
             }
         )
         return [{"loss": 0.0, "eval_psnr": 1.0}]
@@ -667,6 +747,8 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
     assert captured["wandb_logger"] is None
     assert captured["save_eval_visualizations"] == cfg.eval.save_renderings
     assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
+    assert captured["min_lr"] == cfg.train.min_lr
+    assert captured["warmup_steps"] == cfg.train.warmup_steps
 
 
 def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
@@ -710,10 +792,14 @@ def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
         wandb_logger=None,
         save_eval_visualizations=False,
         eval_visualization_limit=4,
+        min_lr=1.0e-8,
+        warmup_steps=4000,
     ):
         captured["wandb_logger"] = wandb_logger
         captured["save_eval_visualizations"] = save_eval_visualizations
         captured["eval_visualization_limit"] = eval_visualization_limit
+        captured["min_lr"] = min_lr
+        captured["warmup_steps"] = warmup_steps
         return [{"loss": 0.0}]
 
     monkeypatch.setattr("rtgs.main.build_rtgs_dataset", lambda root_cfg, stage, use_evaluation_index=False: ["dataset"])
@@ -730,4 +816,6 @@ def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
     assert captured["wandb_logger"] is fake_run
     assert captured["save_eval_visualizations"] == cfg.eval.save_renderings
     assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
+    assert captured["min_lr"] == cfg.train.min_lr
+    assert captured["warmup_steps"] == cfg.train.warmup_steps
     assert fake_run.finished is True
