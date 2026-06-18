@@ -8,6 +8,8 @@ LOG_DIR="${LOG_DIR:-outputs/rtgs_ablate_logs}"
 DRY_RUN="${DRY_RUN:-0}"
 MIN_FREE_VRAM_MB="${MIN_FREE_VRAM_MB:-10000}"
 GPU_PREFERENCE="${GPU_PREFERENCE:-9,0,1,2,3,4,5,6,7,8}"
+CONDA_EXE="${CONDA_EXE:-/data0/xxy/miniconda3/bin/conda}"
+CONDA_ENV="${CONDA_ENV:-rtgs}"
 DA3_LR="${DA3_LR:-1.0e-5}"
 DA3_DEPTH_HEAD_LR="${DA3_DEPTH_HEAD_LR:-1.0e-4}"
 
@@ -222,7 +224,7 @@ run_ablation() {
     echo "[DRY-RUN] ${name} gpu=${gpu}"
     echo "  log: ${log_file}"
     echo "  pid: ${pid_file}"
-    printf "  cmd: CUDA_VISIBLE_DEVICES=%q DA3_LOG_LEVEL=WARN PYTHONPATH=src python -m rtgs.main" "${gpu}"
+    printf "  cmd: CUDA_VISIBLE_DEVICES=%q DA3_LOG_LEVEL=WARN PYTHONPATH=src %q run --no-capture-output -n %q python -m rtgs.main" "${gpu}" "${CONDA_EXE}" "${CONDA_ENV}"
     printf " %q" "${command_args[@]}"
     printf "\n"
     return 0
@@ -233,20 +235,22 @@ set -euo pipefail
 root_dir="$1"
 name="$2"
 gpu="$3"
-shift 3
+conda_exe="$4"
+conda_env="$5"
+shift 5
 cd "${root_dir}"
 echo "[RTGS-ABLATE] START ${name} $(date -Is)"
 echo "[RTGS-ABLATE] PHYSICAL_GPU ${gpu}"
-printf "[RTGS-ABLATE] CMD: CUDA_VISIBLE_DEVICES=%q DA3_LOG_LEVEL=WARN PYTHONPATH=src python -m rtgs.main" "${gpu}"
+printf "[RTGS-ABLATE] CMD: CUDA_VISIBLE_DEVICES=%q DA3_LOG_LEVEL=WARN PYTHONPATH=src %q run --no-capture-output -n %q python -m rtgs.main" "${gpu}" "${conda_exe}" "${conda_env}"
 printf " %q" "$@"
 printf "\n"
 set +e
-CUDA_VISIBLE_DEVICES="${gpu}" DA3_LOG_LEVEL=WARN PYTHONPATH=src python -m rtgs.main "$@"
+CUDA_VISIBLE_DEVICES="${gpu}" DA3_LOG_LEVEL=WARN PYTHONPATH=src "${conda_exe}" run --no-capture-output -n "${conda_env}" python -m rtgs.main "$@"
 status=$?
 set -e
 echo "[RTGS-ABLATE] END ${name} status=${status} $(date -Is)"
 exit "${status}"
-' bash "${ROOT_DIR}" "${name}" "${gpu}" "${command_args[@]}" >"${log_file}" 2>&1 &
+' bash "${ROOT_DIR}" "${name}" "${gpu}" "${CONDA_EXE}" "${CONDA_ENV}" "${command_args[@]}" >"${log_file}" 2>&1 &
 
   echo "$!" > "${pid_file}"
   echo "[RTGS-ABLATE] launched ${name} gpu=${gpu} pid=$(cat "${pid_file}") log=${log_file}"

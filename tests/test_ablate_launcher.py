@@ -59,3 +59,11 @@ def test_ablate_launcher_uses_unique_output_dirs_and_wandb_names() -> None:
     assert len(set(wandb_names)) == 11
     assert "outputs/rtgs_ablate_base" in output_dirs
     assert "rtgs_ablate_all_refinements_train_depth_head_only" in wandb_names
+
+
+def test_ablate_launcher_uses_rtgs_conda_python_by_default() -> None:
+    output = run_dry_run()
+
+    assert "/data0/xxy/miniconda3/bin/conda" in output
+    assert "--no-capture-output" in output
+    assert "-n rtgs python -m rtgs.main" in output
