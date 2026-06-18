@@ -4,19 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
-GPU="${GPU:-9}"
 LOG_DIR="${LOG_DIR:-outputs/rtgs_ablate_logs}"
-QUEUE_LOCK="${QUEUE_LOCK:-${LOG_DIR}/gpu${GPU}.lock}"
 DRY_RUN="${DRY_RUN:-0}"
+MIN_FREE_VRAM_MB="${MIN_FREE_VRAM_MB:-10000}"
+GPU_PREFERENCE="${GPU_PREFERENCE:-9,0,1,2,3,4,5,6,7,8}"
 DA3_LR="${DA3_LR:-1.0e-5}"
 DA3_DEPTH_HEAD_LR="${DA3_DEPTH_HEAD_LR:-1.0e-4}"
 
 mkdir -p "${LOG_DIR}"
-
-if [[ "${DRY_RUN}" != "1" ]] && ! command -v flock >/dev/null 2>&1; then
-  echo "[RTGS-ABLATE] flock is required for serialized nohup launches." >&2
-  exit 1
-fi
 
 BASE_ARGS=(
   mode=train_smoke
@@ -54,9 +49,164 @@ BASE_ARGS=(
   model.gaussian_scale_max=1.0
 )
 
-run_ablation() {
+JOB_NAMES=()
+JOB_ARGS=()
+
+add_ablation() {
   local name="$1"
   shift
+  JOB_NAMES+=("${name}")
+  JOB_ARGS+=("$*")
+}
+
+add_ablation base
+
+add_ablation train_depth_head_only \
+  model.unfreeze_da3=true \
+  model.train_depth_head_only=true \
+  "train.da3_lr=${DA3_LR}" \
+  "train.da3_depth_head_lr=${DA3_DEPTH_HEAD_LR}"
+
+add_ablation unfreeze_whole_da3 \
+  model.unfreeze_da3=true \
+  model.train_depth_head_only=false \
+  "train.da3_lr=${DA3_LR}" \
+  "train.da3_depth_head_lr=${DA3_DEPTH_HEAD_LR}"
+
+add_ablation intrinsic_embedding_only \
+  model.intrinsic_embedding.enabled=true
+
+add_ablation depth_rtgs_features \
+  model.depth_refinement.enabled=true \
+  "model.depth_refinement.da3_feature_layers=[]"
+
+add_ablation depth_both_features \
+  model.depth_refinement.enabled=true \
+  "model.depth_refinement.da3_feature_layers=[5,7,9,11]"
+
+add_ablation depth_both_features_intrinsic \
+  model.depth_refinement.enabled=true \
+  "model.depth_refinement.da3_feature_layers=[5,7,9,11]" \
+  model.intrinsic_embedding.enabled=true
+
+add_ablation camera_refinement_only \
+  model.camera_refinement.enabled=true
+
+add_ablation depth_both_features_camera \
+  model.depth_refinement.enabled=true \
+  "model.depth_refinement.da3_feature_layers=[5,7,9,11]" \
+  model.camera_refinement.enabled=true
+
+add_ablation all_refinements_frozen_da3 \
+  model.intrinsic_embedding.enabled=true \
+  model.depth_refinement.enabled=true \
+  "model.depth_refinement.da3_feature_layers=[5,7,9,11]" \
+  model.camera_refinement.enabled=true
+
+add_ablation all_refinements_train_depth_head_only \
+  model.unfreeze_da3=true \
+  model.train_depth_head_only=true \
+  "train.da3_lr=${DA3_LR}" \
+  "train.da3_depth_head_lr=${DA3_DEPTH_HEAD_LR}" \
+  model.intrinsic_embedding.enabled=true \
+  model.depth_refinement.enabled=true \
+  "model.depth_refinement.da3_feature_layers=[5,7,9,11]" \
+  model.camera_refinement.enabled=true
+
+declare -A GPU_FREE_BY_INDEX=()
+declare -A GPU_CAPACITY_BY_INDEX=()
+
+trim_space() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf "%s" "${value}"
+}
+
+read_gpu_free_memory() {
+  local entry index free
+  if [[ -n "${GPU_FREE_MEMORY:-}" ]]; then
+    IFS=',' read -r -a entries <<< "${GPU_FREE_MEMORY}"
+    for entry in "${entries[@]}"; do
+      index="$(trim_space "${entry%%:*}")"
+      free="$(trim_space "${entry##*:}")"
+      [[ -n "${index}" && -n "${free}" ]] || continue
+      GPU_FREE_BY_INDEX["${index}"]="${free}"
+    done
+    return 0
+  fi
+
+  while IFS=',' read -r index free; do
+    index="$(trim_space "${index}")"
+    free="$(trim_space "${free}")"
+    [[ -n "${index}" && -n "${free}" ]] || continue
+    GPU_FREE_BY_INDEX["${index}"]="${free}"
+  done < <(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits)
+}
+
+build_gpu_assignments() {
+  local job_count="$1"
+  local ordered_gpus=()
+  local gpu free capacity assigned_count
+  local -A seen=()
+  local assignments=()
+
+  read_gpu_free_memory
+  IFS=',' read -r -a preferred_gpus <<< "${GPU_PREFERENCE}"
+  for gpu in "${preferred_gpus[@]}"; do
+    gpu="$(trim_space "${gpu}")"
+    [[ -n "${gpu}" ]] || continue
+    seen["${gpu}"]=1
+    free="${GPU_FREE_BY_INDEX[${gpu}]:-0}"
+    if (( free >= MIN_FREE_VRAM_MB )); then
+      capacity=$((free / MIN_FREE_VRAM_MB))
+      GPU_CAPACITY_BY_INDEX["${gpu}"]="${capacity}"
+      ordered_gpus+=("${gpu}")
+    fi
+  done
+
+  for gpu in "${!GPU_FREE_BY_INDEX[@]}"; do
+    [[ -z "${seen[${gpu}]:-}" ]] || continue
+    free="${GPU_FREE_BY_INDEX[${gpu}]}"
+    if (( free >= MIN_FREE_VRAM_MB )); then
+      capacity=$((free / MIN_FREE_VRAM_MB))
+      GPU_CAPACITY_BY_INDEX["${gpu}"]="${capacity}"
+      ordered_gpus+=("${gpu}")
+    fi
+  done
+
+  if (( ${#ordered_gpus[@]} == 0 )); then
+    echo "[RTGS-ABLATE] No GPUs have at least ${MIN_FREE_VRAM_MB} MB free VRAM." >&2
+    exit 1
+  fi
+
+  while (( ${#assignments[@]} < job_count )); do
+    assigned_count="${#assignments[@]}"
+    for gpu in "${ordered_gpus[@]}"; do
+      capacity="${GPU_CAPACITY_BY_INDEX[${gpu}]:-0}"
+      if (( capacity <= 0 )); then
+        continue
+      fi
+      assignments+=("${gpu}")
+      GPU_CAPACITY_BY_INDEX["${gpu}"]=$((capacity - 1))
+      if (( ${#assignments[@]} == job_count )); then
+        break
+      fi
+    done
+    if (( ${#assignments[@]} == assigned_count )); then
+      echo "[RTGS-ABLATE] Not enough GPU capacity for ${job_count} jobs at ${MIN_FREE_VRAM_MB} MB/job." >&2
+      echo "[RTGS-ABLATE] Free memory: ${GPU_FREE_MEMORY:-$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | tr '\n' ';')}" >&2
+      exit 1
+    fi
+  done
+
+  printf "%s\n" "${assignments[@]}"
+}
+
+run_ablation() {
+  local name="$1"
+  local gpu="$2"
+  shift 2
   local output_dir="outputs/rtgs_ablate_${name}"
   local log_file="${LOG_DIR}/${name}.log"
   local pid_file="${LOG_DIR}/${name}.pid"
@@ -69,10 +219,10 @@ run_ablation() {
   )
 
   if [[ "${DRY_RUN}" == "1" ]]; then
-    echo "[DRY-RUN] ${name}"
+    echo "[DRY-RUN] ${name} gpu=${gpu}"
     echo "  log: ${log_file}"
     echo "  pid: ${pid_file}"
-    printf "  cmd:"
+    printf "  cmd: CUDA_VISIBLE_DEVICES=%q DA3_LOG_LEVEL=WARN PYTHONPATH=src python -m rtgs.main" "${gpu}"
     printf " %q" "${command_args[@]}"
     printf "\n"
     return 0
@@ -82,87 +232,38 @@ run_ablation() {
 set -euo pipefail
 root_dir="$1"
 name="$2"
-lock_file="$3"
-gpu="$4"
-shift 4
+gpu="$3"
+shift 3
 cd "${root_dir}"
-{
-  flock -x 200
-  echo "[RTGS-ABLATE] START ${name} $(date -Is)"
-  echo "[RTGS-ABLATE] GPU ${gpu}"
-  printf "[RTGS-ABLATE] CMD:"
-  printf " %q" "$@"
-  printf "\n"
-  set +e
-  CUDA_VISIBLE_DEVICES="${gpu}" DA3_LOG_LEVEL=WARN PYTHONPATH=src python -m rtgs.main "$@"
-  status=$?
-  set -e
-  echo "[RTGS-ABLATE] END ${name} status=${status} $(date -Is)"
-  exit "${status}"
-} 200>"${lock_file}"
-' bash "${ROOT_DIR}" "${name}" "${QUEUE_LOCK}" "${GPU}" "${command_args[@]}" >"${log_file}" 2>&1 &
+echo "[RTGS-ABLATE] START ${name} $(date -Is)"
+echo "[RTGS-ABLATE] PHYSICAL_GPU ${gpu}"
+printf "[RTGS-ABLATE] CMD: CUDA_VISIBLE_DEVICES=%q DA3_LOG_LEVEL=WARN PYTHONPATH=src python -m rtgs.main" "${gpu}"
+printf " %q" "$@"
+printf "\n"
+set +e
+CUDA_VISIBLE_DEVICES="${gpu}" DA3_LOG_LEVEL=WARN PYTHONPATH=src python -m rtgs.main "$@"
+status=$?
+set -e
+echo "[RTGS-ABLATE] END ${name} status=${status} $(date -Is)"
+exit "${status}"
+' bash "${ROOT_DIR}" "${name}" "${gpu}" "${command_args[@]}" >"${log_file}" 2>&1 &
 
   echo "$!" > "${pid_file}"
-  echo "[RTGS-ABLATE] queued ${name} pid=$(cat "${pid_file}") log=${log_file}"
+  echo "[RTGS-ABLATE] launched ${name} gpu=${gpu} pid=$(cat "${pid_file}") log=${log_file}"
 }
 
-run_ablation base
+mapfile -t GPU_ASSIGNMENTS < <(build_gpu_assignments "${#JOB_NAMES[@]}")
 
-run_ablation train_depth_head_only \
-  model.unfreeze_da3=true \
-  model.train_depth_head_only=true \
-  "train.da3_lr=${DA3_LR}" \
-  "train.da3_depth_head_lr=${DA3_DEPTH_HEAD_LR}"
-
-run_ablation unfreeze_whole_da3 \
-  model.unfreeze_da3=true \
-  model.train_depth_head_only=false \
-  "train.da3_lr=${DA3_LR}" \
-  "train.da3_depth_head_lr=${DA3_DEPTH_HEAD_LR}"
-
-run_ablation intrinsic_embedding_only \
-  model.intrinsic_embedding.enabled=true
-
-run_ablation depth_rtgs_features \
-  model.depth_refinement.enabled=true \
-  "model.depth_refinement.da3_feature_layers=[]"
-
-run_ablation depth_both_features \
-  model.depth_refinement.enabled=true \
-  "model.depth_refinement.da3_feature_layers=[5,7,9,11]"
-
-run_ablation depth_both_features_intrinsic \
-  model.depth_refinement.enabled=true \
-  "model.depth_refinement.da3_feature_layers=[5,7,9,11]" \
-  model.intrinsic_embedding.enabled=true
-
-run_ablation camera_refinement_only \
-  model.camera_refinement.enabled=true
-
-run_ablation depth_both_features_camera \
-  model.depth_refinement.enabled=true \
-  "model.depth_refinement.da3_feature_layers=[5,7,9,11]" \
-  model.camera_refinement.enabled=true
-
-run_ablation all_refinements_frozen_da3 \
-  model.intrinsic_embedding.enabled=true \
-  model.depth_refinement.enabled=true \
-  "model.depth_refinement.da3_feature_layers=[5,7,9,11]" \
-  model.camera_refinement.enabled=true
-
-run_ablation all_refinements_train_depth_head_only \
-  model.unfreeze_da3=true \
-  model.train_depth_head_only=true \
-  "train.da3_lr=${DA3_LR}" \
-  "train.da3_depth_head_lr=${DA3_DEPTH_HEAD_LR}" \
-  model.intrinsic_embedding.enabled=true \
-  model.depth_refinement.enabled=true \
-  "model.depth_refinement.da3_feature_layers=[5,7,9,11]" \
-  model.camera_refinement.enabled=true
+for index in "${!JOB_NAMES[@]}"; do
+  name="${JOB_NAMES[${index}]}"
+  gpu="${GPU_ASSIGNMENTS[${index}]}"
+  read -r -a extra_args <<< "${JOB_ARGS[${index}]}"
+  run_ablation "${name}" "${gpu}" "${extra_args[@]}"
+done
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "[RTGS-ABLATE] dry run complete"
 else
-  echo "[RTGS-ABLATE] all jobs queued with serialized GPU lock: ${QUEUE_LOCK}"
+  echo "[RTGS-ABLATE] all jobs launched in parallel"
   echo "[RTGS-ABLATE] logs and pid files: ${LOG_DIR}"
 fi
