@@ -40,6 +40,8 @@ def build_rtgs_model(cfg: RootConfig) -> RTGSModel:
             dpt_feature_channels=cfg.model.dpt_feature_channels,
             da3_model_name=cfg.model.da3_model_name,
             da3_ref_view_strategy=cfg.model.da3_ref_view_strategy,
+            unfreeze_da3=cfg.model.unfreeze_da3,
+            train_depth_head_only=cfg.model.train_depth_head_only,
             gaussian_scale_min=cfg.model.gaussian_scale_min,
             gaussian_scale_max=cfg.model.gaussian_scale_max,
             sh_degree=cfg.model.sh_degree,

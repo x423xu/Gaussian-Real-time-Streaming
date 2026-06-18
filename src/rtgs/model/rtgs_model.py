@@ -28,6 +28,8 @@ class RTGSModelConfig:
     dpt_feature_channels: int = 128
     da3_model_name: str = "depth-anything/DA3-BASE"
     da3_ref_view_strategy: str = "middle"
+    unfreeze_da3: bool = False
+    train_depth_head_only: bool = False
     gaussian_scale_min: float = 1.0e-4
     gaussian_scale_max: float = 1.0e-2
     sh_degree: int = 3
@@ -102,16 +104,18 @@ class DA3ViewMetaExtractor(nn.Module):
         ref_view_strategy: str = "middle",
         da3_model: Any | None = None,
         export_feat_layers: list[int] | None = None,
+        unfreeze_da3: bool = False,
+        train_depth_head_only: bool = False,
     ) -> None:
         super().__init__()
         self.model_name = model_name
         self.ref_view_strategy = ref_view_strategy
         self.export_feat_layers = list(export_feat_layers or [])
+        self.unfreeze_da3 = bool(unfreeze_da3)
+        self.train_depth_head_only = bool(train_depth_head_only)
         self.da3_model = da3_model if da3_model is not None else self._load_da3_model()
         if isinstance(self.da3_model, nn.Module):
-            self.da3_model.eval()
-            for parameter in self.da3_model.parameters():
-                parameter.requires_grad_(False)
+            self._configure_da3_trainability()
 
     def forward(self, context: dict, image: Tensor) -> dict[str, Any]:
         return self._infer_da3(context, image)
@@ -122,8 +126,13 @@ class DA3ViewMetaExtractor(nn.Module):
 
         return DepthAnything3.from_pretrained(self.model_name)
 
-    @torch.no_grad()
     def _infer_da3(self, context: dict, image: Tensor) -> dict[str, Any]:
+        if self.unfreeze_da3:
+            return self._infer_da3_impl(context, image)
+        with torch.no_grad():
+            return self._infer_da3_impl(context, image)
+
+    def _infer_da3_impl(self, context: dict, image: Tensor) -> dict[str, Any]:
         if self.da3_model is None:
             raise RuntimeError("DA3 is enabled, but no DA3 model is initialized.")
 
@@ -160,6 +169,24 @@ class DA3ViewMetaExtractor(nn.Module):
         if features:
             result["features"] = features
         return result
+
+    def _configure_da3_trainability(self) -> None:
+        if not isinstance(self.da3_model, nn.Module):
+            return
+        if not self.unfreeze_da3:
+            self.da3_model.eval()
+            for parameter in self.da3_model.parameters():
+                parameter.requires_grad_(False)
+            return
+        for name, parameter in self.da3_model.named_parameters():
+            parameter.requires_grad_(not self.train_depth_head_only or self._is_depth_head_parameter(name))
+
+    def _is_depth_head_parameter(self, name: str) -> bool:
+        lowered = name.lower()
+        excluded = ("camera", "cam_", "cam.", "pose", "intrinsic", "extrinsic", "sky")
+        if any(token in lowered for token in excluded):
+            return False
+        return any(token in lowered for token in ("depth", "head", "dpt"))
 
     def _resize_depth(self, depth: Tensor, image_shape: tuple[int, int]) -> Tensor:
         batch, views = depth.shape[:2]
@@ -562,6 +589,8 @@ class RTGSModel(nn.Module):
             model_name=self.cfg.da3_model_name,
             ref_view_strategy=self.cfg.da3_ref_view_strategy,
             export_feat_layers=da3_feature_layers,
+            unfreeze_da3=self.cfg.unfreeze_da3,
+            train_depth_head_only=self.cfg.train_depth_head_only,
         )
         if view_meta_extractor is not None and self.depth_refinement_cfg.enabled and hasattr(self.view_meta_extractor, "export_feat_layers"):
             self.view_meta_extractor.export_feat_layers = list(da3_feature_layers)

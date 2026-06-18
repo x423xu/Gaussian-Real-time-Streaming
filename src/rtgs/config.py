@@ -90,6 +90,8 @@ class ModelConfig:
     dpt_feature_channels: int = 128
     da3_model_name: str = "depth-anything/DA3-BASE"
     da3_ref_view_strategy: str = "middle"
+    unfreeze_da3: bool = False
+    train_depth_head_only: bool = False
     gaussian_scale_min: float = 1.0e-4
     gaussian_scale_max: float = 1.0e-2
     sh_degree: int = 3

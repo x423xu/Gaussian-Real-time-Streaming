@@ -80,6 +80,8 @@ def test_root_config_accepts_rtgs_defaults() -> None:
 def test_refinement_configs_are_disabled_by_default_and_depth_uses_128_bins() -> None:
     cfg = load_typed_root_config({})
 
+    assert cfg.model.unfreeze_da3 is False
+    assert cfg.model.train_depth_head_only is False
     assert cfg.model.intrinsic_embedding["enabled"] is False
     assert cfg.model.depth_refinement["enabled"] is False
     assert cfg.model.depth_refinement["num_depth_bins"] == 128
@@ -371,6 +373,24 @@ class FakeDA3Model:
         return output
 
 
+class FakeTrainableDA3Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = torch.nn.Linear(1, 1)
+        self.head = torch.nn.Linear(1, 1)
+        self.camera_head = torch.nn.Linear(1, 1)
+
+    def forward(self, image, extrinsics=None, intrinsics=None, export_feat_layers=None, infer_gs=False, use_ray_pose=False, ref_view_strategy="middle"):
+        batch, views, _, height, width = image.shape
+        scale = self.head.weight.reshape(())
+        output_intrinsics = torch.eye(3, device=image.device, dtype=image.dtype).reshape(1, 1, 3, 3).repeat(batch, views, 1, 1)
+        return {
+            "depth": torch.ones(batch, views, height, width, 1, device=image.device, dtype=image.dtype) * scale,
+            "extrinsics": torch.eye(4, device=image.device, dtype=image.dtype).reshape(1, 1, 4, 4).repeat(batch, views, 1, 1),
+            "intrinsics": output_intrinsics,
+        }
+
+
 class FakeDecoder(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -464,6 +484,42 @@ def test_da3_view_meta_extractor_runs_one_batched_da3_forward() -> None:
     assert meta["depth"].shape == (2, 2, 2, 2)
     assert meta["intrinsics"].shape == (2, 2, 3, 3)
     assert meta["extrinsics"].shape == (2, 2, 4, 4)
+
+
+def test_da3_view_meta_extractor_freezes_da3_by_default() -> None:
+    fake_da3 = FakeTrainableDA3Model()
+    extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=fake_da3)
+    batch = make_batch(batch_size=1, context_views=1, target_views=1, size=2)
+
+    meta = extractor(batch["context"], batch["context"]["image"])
+
+    assert all(not parameter.requires_grad for parameter in fake_da3.parameters())
+    assert meta["depth"].requires_grad is False
+
+
+def test_da3_view_meta_extractor_can_unfreeze_all_da3_parameters() -> None:
+    fake_da3 = FakeTrainableDA3Model()
+    extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=fake_da3, unfreeze_da3=True)
+    batch = make_batch(batch_size=1, context_views=1, target_views=1, size=2)
+
+    meta = extractor(batch["context"], batch["context"]["image"])
+
+    assert all(parameter.requires_grad for parameter in fake_da3.parameters())
+    assert meta["depth"].requires_grad is True
+
+
+def test_da3_view_meta_extractor_can_train_depth_head_only() -> None:
+    fake_da3 = FakeTrainableDA3Model()
+    extractor = DA3ViewMetaExtractor(
+        model_name="fake",
+        da3_model=fake_da3,
+        unfreeze_da3=True,
+        train_depth_head_only=True,
+    )
+
+    trainable = {name for name, parameter in fake_da3.named_parameters() if parameter.requires_grad}
+
+    assert trainable == {"head.weight", "head.bias"}
 
 
 def test_da3_view_meta_extractor_optionally_returns_intermediate_features() -> None:
