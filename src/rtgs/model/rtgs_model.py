@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import sys
 from typing import Any
@@ -9,7 +9,10 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from .camera_refinement import CameraPoseRefiner, CameraRefinementConfig, coerce_camera_refinement_config
 from .decoder import DecoderOutput, DecoderSplattingCUDA, DecoderSplattingCUDACfg
+from .depth_refinement import CostVolumeDepthRefiner, CostVolumeDepthRefinementConfig, coerce_depth_refinement_config
+from .intrinsic_embedding import IntrinsicEmbedding, IntrinsicEmbeddingConfig, coerce_intrinsic_embedding_config
 
 
 C0 = 0.28209479177387814
@@ -29,6 +32,9 @@ class RTGSModelConfig:
     gaussian_scale_max: float = 1.0e-2
     sh_degree: int = 3
     decoder_background_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    intrinsic_embedding: IntrinsicEmbeddingConfig | dict[str, Any] = field(default_factory=IntrinsicEmbeddingConfig)
+    depth_refinement: CostVolumeDepthRefinementConfig | dict[str, Any] = field(default_factory=CostVolumeDepthRefinementConfig)
+    camera_refinement: CameraRefinementConfig | dict[str, Any] = field(default_factory=CameraRefinementConfig)
 
 
 def _ensure_da3_src_on_path() -> None:
@@ -95,17 +101,19 @@ class DA3ViewMetaExtractor(nn.Module):
         model_name: str,
         ref_view_strategy: str = "middle",
         da3_model: Any | None = None,
+        export_feat_layers: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.model_name = model_name
         self.ref_view_strategy = ref_view_strategy
+        self.export_feat_layers = list(export_feat_layers or [])
         self.da3_model = da3_model if da3_model is not None else self._load_da3_model()
         if isinstance(self.da3_model, nn.Module):
             self.da3_model.eval()
             for parameter in self.da3_model.parameters():
                 parameter.requires_grad_(False)
 
-    def forward(self, context: dict, image: Tensor) -> dict[str, Tensor]:
+    def forward(self, context: dict, image: Tensor) -> dict[str, Any]:
         return self._infer_da3(context, image)
 
     def _load_da3_model(self):
@@ -115,7 +123,7 @@ class DA3ViewMetaExtractor(nn.Module):
         return DepthAnything3.from_pretrained(self.model_name)
 
     @torch.no_grad()
-    def _infer_da3(self, context: dict, image: Tensor) -> dict[str, Tensor]:
+    def _infer_da3(self, context: dict, image: Tensor) -> dict[str, Any]:
         if self.da3_model is None:
             raise RuntimeError("DA3 is enabled, but no DA3 model is initialized.")
 
@@ -133,7 +141,7 @@ class DA3ViewMetaExtractor(nn.Module):
             da3_input,
             None,
             None,
-            [],
+            self.export_feat_layers,
             False,
             False,
             self.ref_view_strategy,
@@ -143,11 +151,15 @@ class DA3ViewMetaExtractor(nn.Module):
         extrinsics_c2w = self._da3_extrinsics_to_c2w(self._extract_batched_extrinsics(raw_output, image, batch, views))
         source_shape = tuple(depth_da3.shape[-2:])
 
-        return {
+        result: dict[str, Tensor | list[Tensor]] = {
             "depth": self._resize_depth(depth_da3, gs_shape),
             "intrinsics": self._scale_intrinsics(intrinsics_da3, source_shape, gs_shape),
             "extrinsics": extrinsics_c2w,
         }
+        features = self._extract_batched_features(raw_output, image, batch, views)
+        if features:
+            result["features"] = features
+        return result
 
     def _resize_depth(self, depth: Tensor, image_shape: tuple[int, int]) -> Tensor:
         batch, views = depth.shape[:2]
@@ -191,6 +203,44 @@ class DA3ViewMetaExtractor(nn.Module):
         if extrinsics.shape[-2:] not in ((3, 4), (4, 4)) or extrinsics.shape[:2] != (batch, views):
             raise ValueError(f"Expected batched DA3 extrinsics shape (B,V,3,4) or (B,V,4,4), got {tuple(extrinsics.shape)}")
         return extrinsics
+
+    def _extract_batched_features(self, raw_output: dict[str, Any], image: Tensor, batch: int, views: int) -> list[Tensor]:
+        features = None
+        for key in ("features", "feature_maps", "intermediate_features", "intermediate_feats", "auxiliary_features", "da3_features"):
+            if key in raw_output:
+                features = raw_output[key]
+                break
+        if features is None:
+            return []
+        flattened = self._flatten_feature_collection(features)
+        result = []
+        for feature in flattened:
+            feature = feature.to(device=image.device, dtype=image.dtype)
+            if feature.ndim == 4 and feature.shape[0] == batch * views:
+                result.append(feature)
+            elif feature.ndim == 5 and feature.shape[:2] == (batch, views):
+                result.append(feature)
+            else:
+                raise ValueError(
+                    "Expected DA3 feature map shape (B,V,C,H,W) or (B*V,C,H,W), "
+                    f"got {tuple(feature.shape)}"
+                )
+        return result
+
+    def _flatten_feature_collection(self, value: Any) -> list[Tensor]:
+        if torch.is_tensor(value):
+            return [value]
+        if isinstance(value, dict):
+            result: list[Tensor] = []
+            for item in value.values():
+                result.extend(self._flatten_feature_collection(item))
+            return result
+        if isinstance(value, (list, tuple)):
+            result = []
+            for item in value:
+                result.extend(self._flatten_feature_collection(item))
+            return result
+        return []
 
     def _da3_extrinsics_to_c2w(self, extrinsics: Tensor) -> Tensor:
         if extrinsics.shape[-2:] == (3, 4):
@@ -434,9 +484,10 @@ class RawDPTUpsampler(nn.Module):
 class TwinGaussianHead(nn.Module):
     """Trainable RTGS twin branch: DINOv2 ViT, raw DPT neck, convolutional Gaussian decoder."""
 
-    def __init__(self, cfg: RTGSModelConfig, output_channels: int) -> None:
+    def __init__(self, cfg: RTGSModelConfig, output_channels: int, intrinsic_embedding_dim: int = 0) -> None:
         super().__init__()
         spec = _vit_spec(cfg.vit_type)
+        self.intrinsic_embedding_dim = int(intrinsic_embedding_dim)
         self.vit = DINOv2FeatureExtractor(
             vit_type=cfg.vit_type,
             pretrained=cfg.vit_pretrained,
@@ -448,17 +499,47 @@ class TwinGaussianHead(nn.Module):
             out_channels=list(spec["out_channels"]),
         )
         self.conv_head = nn.Sequential(
-            nn.Conv2d(cfg.dpt_feature_channels + 3, cfg.dpt_feature_channels, kernel_size=3, padding=1, padding_mode="replicate"),
+            nn.Conv2d(
+                cfg.dpt_feature_channels + 3 + self.intrinsic_embedding_dim,
+                cfg.dpt_feature_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode="replicate",
+            ),
             nn.GELU(),
             nn.Conv2d(cfg.dpt_feature_channels, output_channels, kernel_size=3, padding=1, padding_mode="replicate"),
         )
-        # nn.init.zeros_(self.conv_head[-1].weight[:3])
-        # nn.init.zeros_(self.conv_head[-1].bias[:3])
+        nn.init.zeros_(self.conv_head[-1].weight[:3])
+        nn.init.zeros_(self.conv_head[-1].bias[:3])
 
-    def forward(self, image: Tensor) -> Tensor:
+    def extract_features(self, image: Tensor) -> dict[str, Tensor | list[Tensor]]:
         features = self.vit(image)
         dpt_features = self.dpt(features, tuple(image.shape[-2:]))
-        return self.conv_head(torch.cat([dpt_features, image], dim=1))
+        return {"vit_features": features, "dpt_features": dpt_features}
+
+    def forward_from_features(
+        self,
+        image: Tensor,
+        features: dict[str, Tensor | list[Tensor]],
+        intrinsic_embedding: Tensor | None = None,
+    ) -> Tensor:
+        dpt_features = features["dpt_features"]
+        if not torch.is_tensor(dpt_features):
+            raise ValueError("Expected dpt_features tensor from TwinGaussianHead.extract_features")
+        inputs = [dpt_features, image]
+        if self.intrinsic_embedding_dim > 0:
+            if intrinsic_embedding is None:
+                raise ValueError("TwinGaussianHead requires intrinsic_embedding when intrinsic_embedding_dim > 0")
+            if intrinsic_embedding.shape != (image.shape[0], self.intrinsic_embedding_dim):
+                raise ValueError(
+                    f"Expected intrinsic_embedding shape {(image.shape[0], self.intrinsic_embedding_dim)}, "
+                    f"got {tuple(intrinsic_embedding.shape)}"
+                )
+            inputs.append(intrinsic_embedding[..., None, None].expand(-1, -1, *image.shape[-2:]))
+        return self.conv_head(torch.cat(inputs, dim=1))
+
+    def forward(self, image: Tensor, intrinsic_embedding: Tensor | None = None) -> Tensor:
+        return self.forward_from_features(image, self.extract_features(image), intrinsic_embedding)
 
 
 class RTGSModel(nn.Module):
@@ -473,10 +554,17 @@ class RTGSModel(nn.Module):
     ) -> None:
         super().__init__()
         self.cfg = cfg or RTGSModelConfig()
+        self.intrinsic_embedding_cfg = coerce_intrinsic_embedding_config(self.cfg.intrinsic_embedding)
+        self.depth_refinement_cfg = coerce_depth_refinement_config(self.cfg.depth_refinement)
+        self.camera_refinement_cfg = coerce_camera_refinement_config(self.cfg.camera_refinement)
+        da3_feature_layers = self.depth_refinement_cfg.da3_feature_layers if self.depth_refinement_cfg.enabled else []
         self.view_meta_extractor = view_meta_extractor or DA3ViewMetaExtractor(
             model_name=self.cfg.da3_model_name,
             ref_view_strategy=self.cfg.da3_ref_view_strategy,
+            export_feat_layers=da3_feature_layers,
         )
+        if view_meta_extractor is not None and self.depth_refinement_cfg.enabled and hasattr(self.view_meta_extractor, "export_feat_layers"):
+            self.view_meta_extractor.export_feat_layers = list(da3_feature_layers)
         self.gaussian_adapter = SimpleGaussianAdapter(
             scale_min=self.cfg.gaussian_scale_min,
             scale_max=self.cfg.gaussian_scale_max,
@@ -486,7 +574,27 @@ class RTGSModel(nn.Module):
             DecoderSplattingCUDACfg(background_color=tuple(self.cfg.decoder_background_color))
         )
 
-        self.gaussian_head = gaussian_head or TwinGaussianHead(self.cfg, 3 + self.gaussian_adapter.d_in)
+        intrinsic_dim = self.intrinsic_embedding_cfg.dim if self.intrinsic_embedding_cfg.enabled else 0
+        self.intrinsic_embedding = (
+            IntrinsicEmbedding(self.intrinsic_embedding_cfg.dim, self.intrinsic_embedding_cfg.hidden_dim)
+            if self.intrinsic_embedding_cfg.enabled
+            else None
+        )
+        self.depth_refiner = (
+            CostVolumeDepthRefiner(self.depth_refinement_cfg, intrinsic_embedding_dim=intrinsic_dim)
+            if self.depth_refinement_cfg.enabled
+            else None
+        )
+        self.camera_refiner = (
+            CameraPoseRefiner(self.camera_refinement_cfg, intrinsic_embedding_dim=intrinsic_dim)
+            if self.camera_refinement_cfg.enabled
+            else None
+        )
+        self.gaussian_head = gaussian_head or TwinGaussianHead(
+            self.cfg,
+            3 + self.gaussian_adapter.d_in,
+            intrinsic_embedding_dim=intrinsic_dim,
+        )
 
     def forward(self, batch: dict) -> dict[str, Tensor | dict[str, Tensor]]:
         context = batch["context"]["image"]
@@ -504,13 +612,54 @@ class RTGSModel(nn.Module):
         batch_size, views, _, height, width = context.shape
         target_views = target.shape[1]
         combined_views = self._combine_views_for_da3(batch["context"], batch["target"], context, target)
-        combined_meta = self.view_meta_extractor(combined_views, combined_views["image"])
+        combined_meta = dict(self.view_meta_extractor(combined_views, combined_views["image"]))
+        auxiliary_losses: dict[str, Tensor] = {}
+        diagnostics: dict[str, Tensor] = {}
+        combined_intrinsic_embedding = self._encode_intrinsics(combined_meta["intrinsics"], (height, width))
+        if self.camera_refiner is not None:
+            camera_result = self.camera_refiner(
+                combined_meta["extrinsics"],
+                combined_meta["depth"],
+                combined_intrinsic_embedding,
+                context_views=views,
+            )
+            combined_meta["extrinsics"] = camera_result["extrinsics"]
+            self._merge_named_tensors(auxiliary_losses, camera_result.get("losses", {}))
+            self._merge_named_tensors(diagnostics, camera_result.get("diagnostics", {}))
         context_meta, target_meta = self._split_view_meta(combined_meta, views)
+        context_intrinsic_embedding = (
+            combined_intrinsic_embedding[:, :views] if combined_intrinsic_embedding is not None else None
+        )
+        flat_context = context.reshape(batch_size * views, 3, height, width)
+        gaussian_features = self._extract_gaussian_features(flat_context) if self.depth_refiner is not None else None
+        if self.depth_refiner is not None:
+            context_meta = dict(context_meta)
+            depth_result = self.depth_refiner(
+                context,
+                context_meta["depth"],
+                context_meta["intrinsics"],
+                context_meta["extrinsics"],
+                context_intrinsic_embedding,
+                rtgs_features=self._select_rtgs_cost_features(gaussian_features, batch_size, views),
+                da3_features=context_meta.get("features"),
+            )
+            context_meta["depth"] = depth_result["depth"]
+            self._merge_named_tensors(auxiliary_losses, depth_result.get("losses", {}))
+            self._merge_named_tensors(diagnostics, depth_result.get("diagnostics", {}))
         intrinsics = context_meta["intrinsics"]
         c2w = context_meta["extrinsics"]
         depth = context_meta["depth"]
 
-        raw = self.gaussian_head(context.reshape(batch_size * views, 3, height, width)).reshape(batch_size, views, -1, height, width)
+        flat_intrinsic_embedding = (
+            context_intrinsic_embedding.reshape(batch_size * views, -1)
+            if context_intrinsic_embedding is not None
+            else None
+        )
+        raw = self._run_gaussian_head(
+            flat_context,
+            flat_intrinsic_embedding,
+            gaussian_features,
+        ).reshape(batch_size, views, -1, height, width)
         raw = raw.permute(0, 1, 3, 4, 2).reshape(batch_size, views, height * width, -1)
 
         opacities = raw[..., :1].sigmoid()
@@ -546,6 +695,8 @@ class RTGSModel(nn.Module):
             "view_meta": context_meta,
             "context_view_meta": context_meta,
             "target_view_meta": target_meta,
+            "auxiliary_losses": auxiliary_losses,
+            "diagnostics": diagnostics,
         }
 
     def _combine_views_for_da3(self, context_views: dict, target_views: dict, context_image: Tensor, target_image: Tensor) -> dict[str, Tensor]:
@@ -562,10 +713,59 @@ class RTGSModel(nn.Module):
             "image": torch.cat([context_image, target_image], dim=1),
         }
 
-    def _split_view_meta(self, meta: dict[str, Tensor], context_views: int) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        context_meta = {key: value[:, :context_views] for key, value in meta.items()}
-        target_meta = {key: value[:, context_views:] for key, value in meta.items()}
+    def _split_view_meta(self, meta: dict[str, Any], context_views: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        context_meta = {key: self._slice_view_value(value, 0, context_views) for key, value in meta.items()}
+        target_meta = {key: self._slice_view_value(value, context_views, None) for key, value in meta.items()}
         return context_meta, target_meta
+
+    def _slice_view_value(self, value: Any, start: int, stop: int | None) -> Any:
+        if torch.is_tensor(value):
+            return value[:, start:stop]
+        if isinstance(value, list):
+            return [self._slice_view_value(item, start, stop) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._slice_view_value(item, start, stop) for item in value)
+        if isinstance(value, dict):
+            return {key: self._slice_view_value(item, start, stop) for key, item in value.items()}
+        return value
+
+    def _encode_intrinsics(self, intrinsics: Tensor, image_shape: tuple[int, int]) -> Tensor | None:
+        if self.intrinsic_embedding is None:
+            return None
+        return self.intrinsic_embedding(intrinsics, image_shape)
+
+    def _merge_named_tensors(self, target: dict[str, Tensor], source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        for key, value in source.items():
+            if torch.is_tensor(value):
+                target[str(key)] = value
+
+    def _extract_gaussian_features(self, image: Tensor) -> Any:
+        extractor = getattr(self.gaussian_head, "extract_features", None)
+        if extractor is None:
+            return None
+        return extractor(image)
+
+    def _select_rtgs_cost_features(self, features: Any, batch_size: int, views: int) -> Any:
+        if isinstance(features, dict):
+            dpt_features = features.get("dpt_features")
+            if torch.is_tensor(dpt_features) and dpt_features.ndim == 4 and dpt_features.shape[0] == batch_size * views:
+                return dpt_features.reshape(batch_size, views, dpt_features.shape[1], *dpt_features.shape[-2:])
+            return dpt_features
+        return None
+
+    def _run_gaussian_head(self, image: Tensor, intrinsic_embedding: Tensor | None, features: Any = None) -> Tensor:
+        if features is not None:
+            from_features = getattr(self.gaussian_head, "forward_from_features", None)
+            if from_features is not None:
+                return from_features(image, features, intrinsic_embedding)
+        if intrinsic_embedding is not None:
+            return self.gaussian_head(image, intrinsic_embedding)
+        try:
+            return self.gaussian_head(image, None)
+        except TypeError:
+            return self.gaussian_head(image)
 
     def _prepare_bounds(
         self,

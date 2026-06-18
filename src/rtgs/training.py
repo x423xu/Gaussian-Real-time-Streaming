@@ -35,6 +35,19 @@ def compute_reconstruction_loss(output: dict, batch: dict) -> torch.Tensor:
     return F.mse_loss(render, target)
 
 
+def compute_training_loss(output: dict, batch: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    reconstruction = compute_reconstruction_loss(output, batch)
+    total = reconstruction
+    terms = {"reconstruction_loss": reconstruction}
+    auxiliary = output.get("auxiliary_losses", {})
+    if isinstance(auxiliary, dict):
+        for name, value in auxiliary.items():
+            if torch.is_tensor(value):
+                total = total + value
+                terms[str(name)] = value
+    return total, terms
+
+
 def psnr_from_mse(mse: torch.Tensor) -> torch.Tensor:
     return -10.0 * torch.log10(mse.clamp_min(1.0e-10))
 
@@ -106,6 +119,18 @@ def log_row_to_wandb(wandb_logger: Any | None, row: dict[str, Any]) -> None:
         wandb_logger.log(payload, step=int(row["step"]))
 
 
+def flatten_numeric_summary(value: Any, prefix: str = "") -> dict[str, float]:
+    if isinstance(value, dict):
+        result: dict[str, float] = {}
+        for key, item in value.items():
+            child_prefix = f"{prefix}/{key}" if prefix else str(key)
+            result.update(flatten_numeric_summary(item, child_prefix))
+        return result
+    if isinstance(value, Number) and not isinstance(value, bool):
+        return {prefix: float(value)}
+    return {}
+
+
 def log_visualizations_to_wandb(wandb_logger: Any | None, artifacts: dict[str, Path], step: int | None, namespace: str = "eval") -> None:
     if wandb_logger is None:
         return
@@ -121,6 +146,33 @@ def log_visualizations_to_wandb(wandb_logger: Any | None, artifacts: dict[str, P
     }
     if payload:
         wandb_logger.log(payload, step=step)
+    summary_path = artifacts.get("summary")
+    if summary_path is not None and summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            summary = {}
+        scalar_payload: dict[str, float] = {}
+        scalar_payload.update(
+            {
+                f"{namespace}/scale/{key.removeprefix('scale_statistics/')}": value
+                for key, value in flatten_numeric_summary(summary.get("scale_statistics", {}), "scale_statistics").items()
+            }
+        )
+        scalar_payload.update(
+            {
+                f"{namespace}/opacity/{key.removeprefix('opacity_statistics/')}": value
+                for key, value in flatten_numeric_summary(summary.get("opacity_statistics", {}), "opacity_statistics").items()
+            }
+        )
+        scalar_payload.update(
+            {
+                f"{namespace}/visible_ratio/{key.removeprefix('visible_ratio/')}": value
+                for key, value in flatten_numeric_summary(summary.get("visible_ratio", {}), "visible_ratio").items()
+            }
+        )
+        if scalar_payload:
+            wandb_logger.log(scalar_payload, step=step)
     files = {name: path for name, path in artifacts.items() if path.is_file()}
     if files and hasattr(wandb_logger, "log_artifact"):
         step_suffix = "latest" if step is None else f"step-{int(step)}"
@@ -159,6 +211,7 @@ def evaluate_model(
     was_training = model.training
     model.eval()
     losses: list[torch.Tensor] = []
+    visible_ratios: list[torch.Tensor] = []
     scene_count = 0
     iterator = iter(loader)
     for batch_idx, batch in enumerate(iterator):
@@ -168,6 +221,9 @@ def evaluate_model(
         batch = move_to_device(batch, device, non_blocking=True)
         output = model(batch)
         losses.append(compute_reconstruction_loss(output, batch).detach())
+        visible_ratio = getattr(output["render"], "visible_ratio", None)
+        if visible_ratio is not None:
+            visible_ratios.append(visible_ratio.detach().float().mean())
         if save_visualizations and visualization_dir is not None and batch_idx == 0:
             artifacts = save_eval_visualizations(
                 batch,
@@ -182,12 +238,15 @@ def evaluate_model(
     if not losses:
         return {"eval_loss": float("nan"), "eval_psnr": float("nan"), "eval_batches": 0.0, "eval_scenes": 0.0}
     mean_loss = torch.stack(losses).mean()
-    return {
+    metrics = {
         "eval_loss": float(mean_loss.cpu().item()),
         "eval_psnr": float(psnr_from_mse(mean_loss).cpu().item()),
         "eval_batches": float(len(losses)),
         "eval_scenes": float(scene_count),
     }
+    if visible_ratios:
+        metrics["eval_visible_ratio"] = float(torch.stack(visible_ratios).mean().cpu().item())
+    return metrics
 
 
 def run_train_step(model: nn.Module, batch: dict, optimizer: torch.optim.Optimizer, device: torch.device) -> dict[str, float]:
@@ -195,10 +254,13 @@ def run_train_step(model: nn.Module, batch: dict, optimizer: torch.optim.Optimiz
     batch = move_to_device(batch, device, non_blocking=True)
     optimizer.zero_grad(set_to_none=True)
     output = model(batch)
-    loss = compute_reconstruction_loss(output, batch)
+    loss, loss_terms = compute_training_loss(output, batch)
     loss.backward()
     optimizer.step()
-    return {"loss": float(loss.detach().cpu().item())}
+    metrics = {"loss": float(loss.detach().cpu().item())}
+    for name, value in loss_terms.items():
+        metrics[name] = float(value.detach().cpu().item())
+    return metrics
 
 
 def save_training_checkpoint(model: nn.Module, metrics: list[dict[str, float]], output_dir: Path, name: str) -> None:
@@ -280,6 +342,8 @@ def run_smoke_training(
                 log_file.flush()
                 log_row_to_wandb(wandb_logger, row)
                 eval_text = "" if "eval_psnr" not in row else f" eval_psnr={row['eval_psnr']:.3f} eval_scenes={row['eval_scenes']:.0f}"
+                if "eval_visible_ratio" in row:
+                    eval_text += f" visible={row['eval_visible_ratio']:.3f}"
                 if "eval_time_s" in row:
                     eval_text += f" eval_time={row['eval_time_s']:.1f}s"
                 print(

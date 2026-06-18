@@ -7,6 +7,32 @@ dpt_feature_channels: 128
 da3_model_name: depth-anything/DA3-BASE
 da3_ref_view_strategy: middle
 gaussian_scale_min: 1.0e-4
-gaussian_scale_max: 1.0
-sh_degree: 5
+gaussian_scale_max: 1.0e-2
+sh_degree: 3
 decoder_background_color: [0.0, 0.0, 0.0]
+intrinsic_embedding:
+  enabled: false
+  dim: 32
+  hidden_dim: 64
+depth_refinement:
+  enabled: false
+  type: cost_volume
+  num_depth_bins: 128
+  feature_scale: 4
+  depth_sampling: log
+  bound_source: context
+  prior_sigma: 0.03
+  temperature: 1.0
+  max_log_depth_shift: 0.25
+  detach_da3_depth: true
+  da3_feature_layers: [5, 7, 9, 11]
+  hidden_channels: 16
+  lambda_kl: 0.01
+  lambda_smooth: 0.0
+camera_refinement:
+  enabled: false
+  hidden_dim: 64
+  max_rotation_deg: 1.0
+  max_translation_ratio: 0.02
+  anchor_first_context: true
+  lambda_delta: 0.0

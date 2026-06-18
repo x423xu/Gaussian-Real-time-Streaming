@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -74,6 +75,17 @@ def test_root_config_accepts_rtgs_defaults() -> None:
     assert cfg.wandb.enabled is False
     assert cfg.wandb.entity == "xxy"
     assert cfg.wandb.project == "rtgs"
+
+
+def test_refinement_configs_are_disabled_by_default_and_depth_uses_128_bins() -> None:
+    cfg = load_typed_root_config({})
+
+    assert cfg.model.intrinsic_embedding["enabled"] is False
+    assert cfg.model.depth_refinement["enabled"] is False
+    assert cfg.model.depth_refinement["num_depth_bins"] == 128
+    assert cfg.model.depth_refinement["bound_source"] == "context"
+    assert cfg.model.depth_refinement["depth_sampling"] == "log"
+    assert cfg.model.camera_refinement["enabled"] is False
 
 
 def test_build_dataloader_enables_streaming_options_when_workers_are_used() -> None:
@@ -234,21 +246,41 @@ def test_log_visualizations_to_wandb_logs_images_and_file_artifact(tmp_path, mon
     artifacts = {
         "diagnostic_sheet": tmp_path / "diagnostic.jpg",
         "gaussian_projection": tmp_path / "gaussian.png",
+        "scale_histogram": tmp_path / "scale_histogram.png",
+        "opacity_histogram": tmp_path / "opacity_histogram.png",
         "gaussian_supersplat_ply": tmp_path / "gaussian.ply",
         "summary": tmp_path / "summary.json",
     }
     for path in artifacts.values():
-        path.write_text("unit", encoding="utf-8")
+        if path.suffix == ".json":
+            path.write_text(
+                json.dumps(
+                    {
+                        "visible_ratio": {"mean": 0.75},
+                        "scale_statistics": {"x": {"mean": 0.01, "p95": 0.02}},
+                        "opacity_statistics": {"mean": 0.5, "p95": 0.9},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        else:
+            path.write_text("unit", encoding="utf-8")
 
     run = FakeRun()
     log_visualizations_to_wandb(run, artifacts, step=12, namespace="eval")
 
-    assert set(run.logs[0][0]) == {"eval/diagnostic_sheet", "eval/gaussian_projection"}
+    assert set(run.logs[0][0]) == {"eval/diagnostic_sheet", "eval/gaussian_projection", "eval/scale_histogram", "eval/opacity_histogram"}
     assert run.logs[0][1] == 12
+    assert run.logs[1][0]["eval/visible_ratio/mean"] == 0.75
+    assert run.logs[1][0]["eval/scale/x/mean"] == 0.01
+    assert run.logs[1][0]["eval/opacity/mean"] == 0.5
+    assert run.logs[1][1] == 12
     assert run.artifacts[0].name == "eval-visualizations-step-12"
     assert {name for _, name in run.artifacts[0].files} == {
         "diagnostic_sheet.jpg",
         "gaussian_projection.png",
+        "scale_histogram.png",
+        "opacity_histogram.png",
         "gaussian_supersplat_ply.ply",
         "summary.json",
     }
@@ -269,7 +301,7 @@ def test_save_eval_visualizations_writes_diagnostic_artifacts(tmp_path) -> None:
         "covariances": torch.eye(3).reshape(1, 1, 3, 3).repeat(1, 8, 1, 1),
     }
     output = {
-        "render": DecoderOutput(color=batch["target"]["image"].clone(), depth=None),
+        "render": DecoderOutput(color=batch["target"]["image"].clone(), depth=None, visible_ratio=torch.tensor([[0.75]])),
         "gaussians": gaussians,
         "context_view_meta": {"depth": depth, "intrinsics": intrinsics, "extrinsics": extrinsics},
         "target_view_meta": {"depth": depth, "intrinsics": intrinsics, "extrinsics": extrinsics},
@@ -280,8 +312,14 @@ def test_save_eval_visualizations_writes_diagnostic_artifacts(tmp_path) -> None:
     assert artifacts["diagnostic_sheet"].is_file()
     assert artifacts["da3_pointmap_projection"].is_file()
     assert artifacts["gaussian_projection"].is_file()
+    assert artifacts["scale_histogram"].is_file()
+    assert artifacts["opacity_histogram"].is_file()
     assert artifacts["gaussian_supersplat_ply"].is_file()
     assert artifacts["summary"].is_file()
+    summary = json.loads(artifacts["summary"].read_text(encoding="utf-8"))
+    assert abs(summary["scale_statistics"]["x"]["mean"] - 0.01) < 1.0e-8
+    assert summary["opacity_statistics"]["mean"] == 0.5
+    assert summary["visible_ratio"]["mean"] == 0.75
 
 
 class FakeDA3Prediction:
@@ -302,6 +340,7 @@ class FakeDA3Model:
                 "image_shape": tuple(image.shape),
                 "extrinsics": extrinsics,
                 "intrinsics": intrinsics,
+                "export_feat_layers": export_feat_layers,
                 "ref_view_strategy": ref_view_strategy,
             }
         )
@@ -314,11 +353,22 @@ class FakeDA3Model:
                 dtype=image.dtype,
             )
         output_intrinsics = output_intrinsics.to(device=image.device, dtype=image.dtype).reshape(1, 1, 3, 3).repeat(batch, views, 1, 1)
-        return {
+        output = {
             "depth": torch.ones(batch, views, height, width, 1, device=image.device, dtype=image.dtype),
             "extrinsics": torch.eye(4, device=image.device, dtype=image.dtype).reshape(1, 1, 4, 4).repeat(batch, views, 1, 1),
             "intrinsics": output_intrinsics,
         }
+        if export_feat_layers:
+            output["features"] = [
+                torch.full(
+                    (batch, views, 4, max(1, height // 4), max(1, width // 4)),
+                    float(layer),
+                    device=image.device,
+                    dtype=image.dtype,
+                )
+                for layer in export_feat_layers
+            ]
+        return output
 
 
 class FakeDecoder(torch.nn.Module):
@@ -349,10 +399,27 @@ class FakeGaussianHead(torch.nn.Module):
         super().__init__()
         self.output_channels = output_channels
         self.calls = []
+        self.intrinsic_embedding_calls = []
+        self.feature_calls = []
         self.weight = torch.nn.Parameter(torch.zeros(1))
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
+    def extract_features(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
+        self.feature_calls.append(tuple(image.shape))
+        batch, _, height, width = image.shape
+        return {"dpt_features": image.new_ones(batch, 5, height, width)}
+
+    def forward_from_features(
+        self,
+        image: torch.Tensor,
+        features: dict[str, torch.Tensor],
+        intrinsic_embedding: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert "dpt_features" in features
+        return self.forward(image, intrinsic_embedding)
+
+    def forward(self, image: torch.Tensor, intrinsic_embedding: torch.Tensor | None = None) -> torch.Tensor:
         self.calls.append(tuple(image.shape))
+        self.intrinsic_embedding_calls.append(None if intrinsic_embedding is None else tuple(intrinsic_embedding.shape))
         batch, _, height, width = image.shape
         raw = image.new_zeros(batch, self.output_channels, height, width)
         if self.output_channels > 10:
@@ -399,6 +466,93 @@ def test_da3_view_meta_extractor_runs_one_batched_da3_forward() -> None:
     assert meta["extrinsics"].shape == (2, 2, 4, 4)
 
 
+def test_da3_view_meta_extractor_optionally_returns_intermediate_features() -> None:
+    fake_da3 = FakeDA3Model()
+    extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=fake_da3, export_feat_layers=[5, 7])
+    batch = make_batch(batch_size=1, context_views=2, target_views=1, size=8)
+    batch["context"]["da3_input"] = torch.rand(1, 2, 3, 16, 16)
+
+    meta = extractor(batch["context"], batch["context"]["image"])
+
+    assert fake_da3.forward_calls[0]["export_feat_layers"] == [5, 7]
+    assert len(meta["features"]) == 2
+    assert meta["features"][0].shape == (1, 2, 4, 4, 4)
+
+
+def test_intrinsic_embedding_encodes_per_view_camera_values_and_broadcasts() -> None:
+    from rtgs.model.intrinsic_embedding import IntrinsicEmbedding
+
+    intrinsics = torch.tensor(
+        [
+            [
+                [[16.0, 0.0, 8.0], [0.0, 20.0, 10.0], [0.0, 0.0, 1.0]],
+                [[18.0, 0.0, 7.0], [0.0, 22.0, 9.0], [0.0, 0.0, 1.0]],
+            ]
+        ]
+    )
+    embedding = IntrinsicEmbedding(dim=8, hidden_dim=16)
+
+    encoded = embedding(intrinsics, image_shape=(20, 16))
+    spatial = embedding.broadcast(encoded, image_shape=(5, 4))
+
+    assert encoded.shape == (1, 2, 8)
+    assert spatial.shape == (1, 2, 8, 5, 4)
+    assert torch.allclose(spatial[:, :, :, 0, 0], encoded)
+    assert not torch.allclose(encoded[:, 0], encoded[:, 1])
+
+
+def test_cost_volume_depth_refiner_uses_context_bounds_and_starts_as_da3_depth() -> None:
+    from rtgs.model.depth_refinement import CostVolumeDepthRefiner, CostVolumeDepthRefinementConfig
+
+    images = torch.rand(1, 2, 3, 8, 8)
+    depth = torch.stack(
+        [
+            torch.linspace(1.0, 2.0, 64).reshape(8, 8),
+            torch.linspace(2.0, 4.0, 64).reshape(8, 8),
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    intrinsics = torch.tensor([[8.0, 0.0, 4.0], [0.0, 8.0, 4.0], [0.0, 0.0, 1.0]]).reshape(1, 1, 3, 3).repeat(1, 2, 1, 1)
+    extrinsics = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    refiner = CostVolumeDepthRefiner(
+        CostVolumeDepthRefinementConfig(
+            enabled=True,
+            num_depth_bins=128,
+            feature_scale=4,
+            prior_sigma=0.03,
+            lambda_kl=0.01,
+            lambda_smooth=0.0,
+        )
+    )
+
+    rtgs_features = torch.rand(1, 2, 8, 2, 2)
+    da3_features = [torch.rand(1, 2, 4, 4, 4), torch.rand(1, 2, 6, 2, 2)]
+
+    result = refiner(images, depth, intrinsics, extrinsics, rtgs_features=rtgs_features, da3_features=da3_features)
+
+    assert result["depth"].shape == depth.shape
+    assert result["probability"].shape == (1, 2, 128, 2, 2)
+    assert torch.allclose(result["near"], torch.tensor([1.0]))
+    assert torch.allclose(result["far"], torch.tensor([4.0]))
+    assert torch.allclose(result["depth"], depth, atol=1.0e-5)
+    assert result["losses"]["depth_refinement_kl"].item() < 1.0e-8
+    assert not any(isinstance(module, torch.nn.Conv3d) for module in refiner.modules())
+    assert any(isinstance(module, torch.nn.Conv2d) for module in refiner.modules())
+
+
+def test_camera_pose_refiner_is_identity_at_initialization() -> None:
+    from rtgs.model.camera_refinement import CameraPoseRefiner, CameraRefinementConfig
+
+    extrinsics = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, 3, 1, 1)
+    depth = torch.ones(1, 3, 4, 4)
+    refiner = CameraPoseRefiner(CameraRefinementConfig(enabled=True, hidden_dim=8, lambda_delta=0.1))
+
+    result = refiner(extrinsics, depth, context_views=2)
+
+    assert torch.allclose(result["extrinsics"], extrinsics)
+    assert result["losses"]["camera_delta_regularization"].item() == 0.0
+
+
 def test_rtgs_model_uses_twin_vit_dpt_gaussian_head_and_forward_contract() -> None:
     fake_da3 = FakeDA3Model()
     extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=fake_da3)
@@ -409,6 +563,9 @@ def test_rtgs_model_uses_twin_vit_dpt_gaussian_head_and_forward_contract() -> No
     assert not hasattr(model, "conv1")
     assert not hasattr(model, "conv2")
     assert isinstance(model.gaussian_adapter, SimpleGaussianAdapter)
+    assert model.intrinsic_embedding is None
+    assert model.depth_refiner is None
+    assert model.camera_refiner is None
 
     output = model(make_batch())
 
@@ -429,6 +586,60 @@ def test_rtgs_model_uses_twin_vit_dpt_gaussian_head_and_forward_contract() -> No
     assert decoder.calls[0]["extrinsics"] == (1, 3, 4, 4)
     assert decoder.calls[0]["intrinsics"] == (1, 3, 3, 3)
     assert decoder.calls[0]["image_shape"] == (16, 16)
+
+
+def test_rtgs_model_refines_context_depth_when_cost_volume_is_enabled() -> None:
+    from rtgs.model.depth_refinement import CostVolumeDepthRefinementConfig
+    from rtgs.model.intrinsic_embedding import IntrinsicEmbeddingConfig
+
+    class DepthScalingRefiner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_intrinsic_embedding = None
+
+        def forward(self, images, depth, intrinsics, extrinsics, intrinsic_embedding=None, rtgs_features=None, da3_features=None):
+            self.seen_intrinsic_embedding = intrinsic_embedding
+            self.seen_rtgs_features = rtgs_features
+            self.seen_da3_features = da3_features
+            return {
+                "depth": depth * 2.0,
+                "losses": {"depth_refinement_kl": depth.sum() * 0.0},
+                "diagnostics": {"depth_refinement_mean_abs_log_shift": torch.tensor(0.0)},
+            }
+
+    batch = make_batch(batch_size=1, context_views=1, target_views=1, size=2)
+    batch["context"]["da3_input"] = torch.rand(1, 1, 3, 2, 2)
+    batch["target"]["da3_input"] = torch.rand(1, 1, 3, 2, 2)
+    fake_da3 = FakeDA3Model(intrinsics=torch.eye(3))
+    gaussian_head = make_fake_gaussian_head()
+    model = RTGSModel(
+        RTGSModelConfig(
+            hidden_channels=8,
+            intrinsic_embedding=IntrinsicEmbeddingConfig(enabled=True, dim=4, hidden_dim=8),
+            depth_refinement=CostVolumeDepthRefinementConfig(enabled=True),
+        ),
+        view_meta_extractor=DA3ViewMetaExtractor(model_name="fake", da3_model=fake_da3),
+        decoder=FakeDecoder(),
+        gaussian_head=gaussian_head,
+    )
+    depth_refiner = DepthScalingRefiner()
+    model.depth_refiner = depth_refiner
+
+    output = model(batch)
+
+    expected_means = torch.tensor(
+        [[[0.0, 0.0, 2.0], [2.0, 0.0, 2.0], [0.0, 2.0, 2.0], [2.0, 2.0, 2.0]]]
+    )
+    assert depth_refiner.seen_intrinsic_embedding is not None
+    assert depth_refiner.seen_intrinsic_embedding.shape == (1, 1, 4)
+    assert depth_refiner.seen_rtgs_features.shape == (1, 1, 5, 2, 2)
+    assert len(depth_refiner.seen_da3_features) == 4
+    assert depth_refiner.seen_da3_features[0].shape == (1, 1, 4, 1, 1)
+    assert gaussian_head.intrinsic_embedding_calls == [(1, 4)]
+    assert gaussian_head.feature_calls == [(1, 3, 2, 2)]
+    assert torch.allclose(output["context_view_meta"]["depth"], torch.full((1, 1, 2, 2), 2.0))
+    assert torch.allclose(output["gaussians"]["means"], expected_means, atol=1.0e-6)
+    assert "depth_refinement_kl" in output["auxiliary_losses"]
 
 
 def test_rtgs_model_maps_vit_type_to_dinov2_and_dpt_config() -> None:
@@ -472,6 +683,12 @@ class FakeEvalModel(torch.nn.Module):
         return {"render": DecoderOutput(color=torch.zeros_like(batch["target"]["image"]), depth=None)}
 
 
+class FakeVisibleEvalModel(torch.nn.Module):
+    def forward(self, batch):
+        visible_ratio = torch.full(batch["target"]["image"].shape[:2], 0.25)
+        return {"render": DecoderOutput(color=torch.zeros_like(batch["target"]["image"]), depth=None, visible_ratio=visible_ratio)}
+
+
 def test_evaluate_model_reports_sampled_scene_count_separately_from_batches() -> None:
     from rtgs.training import evaluate_model
 
@@ -484,6 +701,16 @@ def test_evaluate_model_reports_sampled_scene_count_separately_from_batches() ->
 
     assert metrics["eval_batches"] == 2.0
     assert metrics["eval_scenes"] == 3.0
+
+
+def test_evaluate_model_reports_visible_ratio_when_decoder_provides_it() -> None:
+    from rtgs.training import evaluate_model
+
+    loader = [{"target": {"image": torch.zeros(2, 3, 3, 2, 2)}, "scene": ["scene_a", "scene_b"]}]
+
+    metrics = evaluate_model(FakeVisibleEvalModel(), loader, torch.device("cpu"))
+
+    assert metrics["eval_visible_ratio"] == 0.25
 
 
 def test_evaluate_model_max_batches_is_only_an_optional_cap() -> None:

@@ -24,6 +24,44 @@ def _default_view_sampler() -> dict[str, Any]:
     }
 
 
+def _default_intrinsic_embedding() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "dim": 32,
+        "hidden_dim": 64,
+    }
+
+
+def _default_depth_refinement() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "type": "cost_volume",
+        "num_depth_bins": 128,
+        "feature_scale": 4,
+        "depth_sampling": "log",
+        "bound_source": "context",
+        "prior_sigma": 0.03,
+        "temperature": 1.0,
+        "max_log_depth_shift": 0.25,
+        "detach_da3_depth": True,
+        "da3_feature_layers": [5, 7, 9, 11],
+        "hidden_channels": 16,
+        "lambda_kl": 0.01,
+        "lambda_smooth": 0.0,
+    }
+
+
+def _default_camera_refinement() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "hidden_dim": 64,
+        "max_rotation_deg": 1.0,
+        "max_translation_ratio": 0.02,
+        "anchor_first_context": True,
+        "lambda_delta": 0.0,
+    }
+
+
 @dataclass(slots=True)
 class DatasetConfig:
     name: str = "re10k_unposed"
@@ -56,6 +94,9 @@ class ModelConfig:
     gaussian_scale_max: float = 1.0e-2
     sh_degree: int = 3
     decoder_background_color: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    intrinsic_embedding: dict[str, Any] = field(default_factory=_default_intrinsic_embedding)
+    depth_refinement: dict[str, Any] = field(default_factory=_default_depth_refinement)
+    camera_refinement: dict[str, Any] = field(default_factory=_default_camera_refinement)
 
 
 @dataclass(slots=True)

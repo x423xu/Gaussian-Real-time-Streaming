@@ -44,6 +44,9 @@ def build_rtgs_model(cfg: RootConfig) -> RTGSModel:
             gaussian_scale_max=cfg.model.gaussian_scale_max,
             sh_degree=cfg.model.sh_degree,
             decoder_background_color=tuple(cfg.model.decoder_background_color),
+            intrinsic_embedding=cfg.model.intrinsic_embedding,
+            depth_refinement=cfg.model.depth_refinement,
+            camera_refinement=cfg.model.camera_refinement,
         )
     )
 
@@ -186,7 +189,8 @@ def eval_checkpoint(cfg: RootConfig) -> None:
     finally:
         if wandb_logger is not None:
             wandb_logger.finish()
-    print(f"[RTGS] eval_loss={metrics['eval_loss']:.6f} eval_psnr={metrics['eval_psnr']:.3f} eval_batches={metrics['eval_batches']:.0f}")
+    visible_text = "" if "eval_visible_ratio" not in metrics else f" eval_visible_ratio={metrics['eval_visible_ratio']:.3f}"
+    print(f"[RTGS] eval_loss={metrics['eval_loss']:.6f} eval_psnr={metrics['eval_psnr']:.3f} eval_batches={metrics['eval_batches']:.0f}{visible_text}")
 
 
 @hydra.main(version_base=None, config_path="../../config", config_name="main")
