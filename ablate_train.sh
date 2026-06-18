@@ -10,6 +10,7 @@ MIN_FREE_VRAM_MB="${MIN_FREE_VRAM_MB:-10000}"
 GPU_PREFERENCE="${GPU_PREFERENCE:-9,0,1,2,3,4,5,6,7,8}"
 CONDA_EXE="${CONDA_EXE:-/data0/xxy/miniconda3/bin/conda}"
 CONDA_ENV="${CONDA_ENV:-rtgs}"
+ONLY="${ONLY:-}"
 DA3_LR="${DA3_LR:-1.0e-5}"
 DA3_DEPTH_HEAD_LR="${DA3_DEPTH_HEAD_LR:-1.0e-4}"
 
@@ -54,9 +55,35 @@ BASE_ARGS=(
 JOB_NAMES=()
 JOB_ARGS=()
 
+trim_space() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf "%s" "${value}"
+}
+
+should_add_job() {
+  local name="$1"
+  local selected
+  if [[ -z "${ONLY}" ]]; then
+    return 0
+  fi
+  IFS=',' read -r -a selected_jobs <<< "${ONLY}"
+  for selected in "${selected_jobs[@]}"; do
+    selected="$(trim_space "${selected}")"
+    if [[ "${selected}" == "${name}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 add_ablation() {
   local name="$1"
   shift
+  if ! should_add_job "${name}"; then
+    return 0
+  fi
   JOB_NAMES+=("${name}")
   JOB_ARGS+=("$*")
 }
@@ -117,13 +144,6 @@ add_ablation all_refinements_train_depth_head_only \
 
 declare -A GPU_FREE_BY_INDEX=()
 declare -A GPU_CAPACITY_BY_INDEX=()
-
-trim_space() {
-  local value="$1"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf "%s" "${value}"
-}
 
 read_gpu_free_memory() {
   local entry index free
@@ -257,6 +277,13 @@ exit "${status}"
 }
 
 mapfile -t GPU_ASSIGNMENTS < <(build_gpu_assignments "${#JOB_NAMES[@]}")
+if (( ${#JOB_NAMES[@]} == 0 )); then
+  echo "[RTGS-ABLATE] No ablation jobs selected. Check ONLY=${ONLY}." >&2
+  exit 1
+fi
+if (( ${#GPU_ASSIGNMENTS[@]} != ${#JOB_NAMES[@]} )); then
+  exit 1
+fi
 
 for index in "${!JOB_NAMES[@]}"; do
   name="${JOB_NAMES[${index}]}"

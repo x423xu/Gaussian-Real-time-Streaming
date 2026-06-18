@@ -10,13 +10,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 
-def run_dry_run(free_memory: str = "9:48665,0:29335,1:36511,2:3880,4:31815") -> str:
+def run_dry_run(free_memory: str = "9:48665,0:29335,1:36511,2:3880,4:31815", **extra_env: str) -> str:
     env = os.environ.copy()
     env.update(
         {
             "DRY_RUN": "1",
             "GPU_FREE_MEMORY": free_memory,
             "MIN_FREE_VRAM_MB": "10000",
+            **extra_env,
         }
     )
     result = subprocess.run(
@@ -67,3 +68,39 @@ def test_ablate_launcher_uses_rtgs_conda_python_by_default() -> None:
     assert "/data0/xxy/miniconda3/bin/conda" in output
     assert "--no-capture-output" in output
     assert "-n rtgs python -m rtgs.main" in output
+
+
+def test_ablate_launcher_can_launch_selected_jobs_only() -> None:
+    output = run_dry_run(free_memory="9:48665", GPU_PREFERENCE="9", ONLY="base,depth_both_features")
+    launch_lines = [line for line in output.splitlines() if line.startswith("[DRY-RUN]")]
+
+    assert launch_lines == [
+        "[DRY-RUN] base gpu=9",
+        "[DRY-RUN] depth_both_features gpu=9",
+    ]
+
+
+def test_ablate_launcher_reports_insufficient_gpu_capacity_cleanly() -> None:
+    env = os.environ.copy()
+    env.update(
+        {
+            "DRY_RUN": "1",
+            "GPU_FREE_MEMORY": "9:10000",
+            "GPU_PREFERENCE": "9",
+            "MIN_FREE_VRAM_MB": "10000",
+            "ONLY": "base,depth_both_features",
+        }
+    )
+    result = subprocess.run(
+        ["bash", "ablate_train.sh"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Not enough GPU capacity" in result.stderr
+    assert "unbound variable" not in result.stderr
