@@ -117,6 +117,11 @@ class DA3ViewMetaExtractor(nn.Module):
         if isinstance(self.da3_model, nn.Module):
             self._configure_da3_trainability()
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._configure_da3_modes(mode)
+        return self
+
     def forward(self, context: dict, image: Tensor) -> dict[str, Any]:
         return self._infer_da3(context, image)
 
@@ -174,14 +179,41 @@ class DA3ViewMetaExtractor(nn.Module):
         if not isinstance(self.da3_model, nn.Module):
             return
         if not self.unfreeze_da3:
-            self.da3_model.eval()
             for parameter in self.da3_model.parameters():
                 parameter.requires_grad_(False)
+            self._configure_da3_modes(self.training)
             return
         for name, parameter in self.da3_model.named_parameters():
             parameter.requires_grad_(not self.train_depth_head_only or self._is_depth_head_parameter(name))
+        self._configure_da3_modes(self.training)
+
+    def _configure_da3_modes(self, mode: bool) -> None:
+        if not isinstance(self.da3_model, nn.Module):
+            return
+        if not self.unfreeze_da3:
+            self.da3_model.eval()
+            return
+        if not self.train_depth_head_only:
+            self.da3_model.train(mode)
+            return
+        if not mode:
+            self.da3_model.eval()
+            return
+        self.da3_model.train(True)
+        for name, module in self.da3_model.named_modules():
+            if name and not self._is_depth_head_module(name):
+                module.eval()
+        for name, module in self.da3_model.named_modules():
+            if name and self._is_depth_head_module(name):
+                module.train(True)
 
     def _is_depth_head_parameter(self, name: str) -> bool:
+        return self._is_depth_head_name(name)
+
+    def _is_depth_head_module(self, name: str) -> bool:
+        return self._is_depth_head_name(name)
+
+    def _is_depth_head_name(self, name: str) -> bool:
         lowered = name.lower()
         excluded = ("camera", "cam_", "cam.", "pose", "intrinsic", "extrinsic", "sky")
         if any(token in lowered for token in excluded):

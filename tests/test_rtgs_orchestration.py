@@ -522,6 +522,38 @@ def test_da3_view_meta_extractor_can_train_depth_head_only() -> None:
     assert trainable == {"head.weight", "head.bias"}
 
 
+def test_da3_view_meta_extractor_preserves_da3_modes_during_parent_train() -> None:
+    frozen_da3 = FakeTrainableDA3Model()
+    frozen_extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=frozen_da3)
+    frozen_extractor.train()
+
+    assert frozen_da3.training is False
+    assert frozen_da3.backbone.training is False
+    assert frozen_da3.head.training is False
+
+    unfrozen_da3 = FakeTrainableDA3Model()
+    unfrozen_extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=unfrozen_da3, unfreeze_da3=True)
+    unfrozen_extractor.train()
+
+    assert unfrozen_da3.training is True
+    assert unfrozen_da3.backbone.training is True
+    assert unfrozen_da3.head.training is True
+
+    depth_only_da3 = FakeTrainableDA3Model()
+    depth_only_extractor = DA3ViewMetaExtractor(
+        model_name="fake",
+        da3_model=depth_only_da3,
+        unfreeze_da3=True,
+        train_depth_head_only=True,
+    )
+    depth_only_extractor.train()
+
+    assert depth_only_da3.training is True
+    assert depth_only_da3.backbone.training is False
+    assert depth_only_da3.head.training is True
+    assert depth_only_da3.camera_head.training is False
+
+
 def test_da3_view_meta_extractor_optionally_returns_intermediate_features() -> None:
     fake_da3 = FakeDA3Model()
     extractor = DA3ViewMetaExtractor(model_name="fake", da3_model=fake_da3, export_feat_layers=[5, 7])
