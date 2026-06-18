@@ -157,6 +157,8 @@ def train_smoke(cfg: RootConfig) -> None:
             cfg.eval.save_rendering_limit,
             cfg.train.min_lr,
             cfg.train.warmup_steps,
+            cfg.train.da3_lr,
+            cfg.train.da3_depth_head_lr,
         )
     finally:
         if wandb_logger is not None:

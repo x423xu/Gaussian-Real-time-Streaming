@@ -66,9 +66,70 @@ def cosine_warmup_lr(step: int, total_steps: int, max_lr: float, min_lr: float =
     return float(min_lr + (max_lr - min_lr) * cosine)
 
 
+def _scaled_initial_lr(min_lr: float, peak_lr: float, base_peak_lr: float) -> tuple[float, float]:
+    lr_scale = 1.0 if base_peak_lr == 0.0 else float(peak_lr) / float(base_peak_lr)
+    return float(min_lr) * lr_scale, lr_scale
+
+
+def _da3_parameter_names_by_id(model: nn.Module) -> tuple[dict[int, str], Any | None]:
+    extractor = getattr(model, "view_meta_extractor", None)
+    da3_model = getattr(extractor, "da3_model", None)
+    if not isinstance(da3_model, nn.Module):
+        return {}, None
+    return {id(parameter): name for name, parameter in da3_model.named_parameters()}, extractor
+
+
+def build_optimizer(
+    model: nn.Module,
+    lr: float,
+    min_lr: float = 1.0e-8,
+    da3_lr: float | None = None,
+    da3_depth_head_lr: float | None = None,
+) -> torch.optim.Optimizer:
+    da3_peak_lr = float(lr if da3_lr is None else da3_lr)
+    da3_depth_head_peak_lr = float(da3_peak_lr if da3_depth_head_lr is None else da3_depth_head_lr)
+    da3_names_by_id, extractor = _da3_parameter_names_by_id(model)
+    is_depth_head = getattr(extractor, "_is_depth_head_parameter", None)
+
+    grouped: dict[str, list[nn.Parameter]] = {"other": [], "da3_depth_head": [], "da3": []}
+    for _, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        da3_name = da3_names_by_id.get(id(parameter))
+        if da3_name is None:
+            grouped["other"].append(parameter)
+        elif callable(is_depth_head) and is_depth_head(da3_name):
+            grouped["da3_depth_head"].append(parameter)
+        else:
+            grouped["da3"].append(parameter)
+
+    group_specs = [
+        ("other", float(lr), grouped["other"]),
+        ("da3_depth_head", da3_depth_head_peak_lr, grouped["da3_depth_head"]),
+        ("da3", da3_peak_lr, grouped["da3"]),
+    ]
+    param_groups = []
+    for name, peak_lr, parameters in group_specs:
+        if not parameters:
+            continue
+        initial_lr, lr_scale = _scaled_initial_lr(min_lr, peak_lr, float(lr))
+        param_groups.append(
+            {
+                "name": name,
+                "params": parameters,
+                "lr": initial_lr,
+                "lr_scale": lr_scale,
+                "peak_lr": peak_lr,
+            }
+        )
+    if not param_groups:
+        raise ValueError("Cannot build optimizer because the model has no trainable parameters.")
+    return torch.optim.Adam(param_groups)
+
+
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
-        group["lr"] = lr
+        group["lr"] = float(lr) * float(group.get("lr_scale", 1.0))
 
 
 def format_duration(seconds: float) -> str:
@@ -285,10 +346,12 @@ def run_smoke_training(
     eval_visualization_limit: int = 4,
     min_lr: float = 1.0e-8,
     warmup_steps: int = 4000,
+    da3_lr: float | None = None,
+    da3_depth_head_lr: float | None = None,
 ) -> list[dict[str, float]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=min_lr)
+    optimizer = build_optimizer(model, lr=lr, min_lr=min_lr, da3_lr=da3_lr, da3_depth_head_lr=da3_depth_head_lr)
     metrics = []
     iterator = iter(loader)
     log_path = output_dir / "train_metrics.jsonl"

@@ -17,6 +17,7 @@ from rtgs.data.dataloader import build_dataloader
 from rtgs.model.decoder import DecoderOutput
 from rtgs.model.rtgs_model import DA3ViewMetaExtractor, RTGSModel, RTGSModelConfig, SimpleGaussianAdapter
 from rtgs.training import (
+    build_optimizer,
     compute_reconstruction_loss,
     cosine_warmup_lr,
     format_duration,
@@ -24,6 +25,7 @@ from rtgs.training import (
     log_visualizations_to_wandb,
     run_smoke_training,
     run_train_step,
+    set_optimizer_lr,
 )
 from rtgs.visualization import save_eval_visualizations
 
@@ -82,12 +84,30 @@ def test_refinement_configs_are_disabled_by_default_and_depth_uses_128_bins() ->
 
     assert cfg.model.unfreeze_da3 is False
     assert cfg.model.train_depth_head_only is False
+    assert cfg.train.da3_lr is None
+    assert cfg.train.da3_depth_head_lr is None
     assert cfg.model.intrinsic_embedding["enabled"] is False
     assert cfg.model.depth_refinement["enabled"] is False
     assert cfg.model.depth_refinement["num_depth_bins"] == 128
     assert cfg.model.depth_refinement["bound_source"] == "context"
     assert cfg.model.depth_refinement["depth_sampling"] == "log"
     assert cfg.model.camera_refinement["enabled"] is False
+
+
+def test_train_config_accepts_da3_specific_learning_rates() -> None:
+    cfg = load_typed_root_config(
+        {
+            "train": {
+                "lr": 1.0e-4,
+                "da3_lr": 1.0e-5,
+                "da3_depth_head_lr": 2.0e-5,
+            }
+        }
+    )
+
+    assert cfg.train.lr == 1.0e-4
+    assert cfg.train.da3_lr == 1.0e-5
+    assert cfg.train.da3_depth_head_lr == 2.0e-5
 
 
 def test_build_dataloader_enables_streaming_options_when_workers_are_used() -> None:
@@ -217,6 +237,21 @@ def test_run_smoke_training_logs_scheduled_learning_rate(tmp_path) -> None:
         cosine_warmup_lr(1, 3, 1.0e-3, 1.0e-5, 2),
         cosine_warmup_lr(2, 3, 1.0e-3, 1.0e-5, 2),
     ]
+
+
+def test_set_optimizer_lr_preserves_group_learning_rate_ratios() -> None:
+    first = torch.nn.Parameter(torch.ones(1))
+    second = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.Adam(
+        [
+            {"params": [first], "lr": 1.0e-4, "lr_scale": 1.0},
+            {"params": [second], "lr": 2.0e-5, "lr_scale": 0.2},
+        ]
+    )
+
+    set_optimizer_lr(optimizer, 5.0e-5)
+
+    assert [group["lr"] for group in optimizer.param_groups] == [5.0e-5, 1.0e-5]
 
 
 def test_log_visualizations_to_wandb_logs_images_and_file_artifact(tmp_path, monkeypatch) -> None:
@@ -520,6 +555,41 @@ def test_da3_view_meta_extractor_can_train_depth_head_only() -> None:
     trainable = {name for name, parameter in fake_da3.named_parameters() if parameter.requires_grad}
 
     assert trainable == {"head.weight", "head.bias"}
+
+
+def test_build_optimizer_splits_other_da3_and_da3_depth_head_learning_rates() -> None:
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.other = torch.nn.Linear(1, 1)
+            self.view_meta_extractor = DA3ViewMetaExtractor(
+                model_name="fake",
+                da3_model=FakeTrainableDA3Model(),
+                unfreeze_da3=True,
+            )
+
+    model = Wrapper()
+
+    optimizer = build_optimizer(
+        model,
+        lr=1.0e-4,
+        min_lr=1.0e-8,
+        da3_lr=1.0e-5,
+        da3_depth_head_lr=2.0e-5,
+    )
+    lrs_by_name = {group["name"]: group["lr"] for group in optimizer.param_groups}
+    scales_by_name = {group["name"]: group["lr_scale"] for group in optimizer.param_groups}
+
+    assert lrs_by_name == {
+        "other": 1.0e-8,
+        "da3_depth_head": 2.0e-9,
+        "da3": 1.0e-9,
+    }
+    assert scales_by_name == {
+        "other": 1.0,
+        "da3_depth_head": 0.2,
+        "da3": 0.1,
+    }
 
 
 def test_da3_view_meta_extractor_preserves_da3_modes_during_parent_train() -> None:
@@ -918,7 +988,14 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
         {
             "runtime": {"device": "cpu"},
             "dataset": {"view_sampler": {"name": "bounded", "num_target_views": 4}},
-            "train": {"steps": 0, "batch_size": 1, "lr": 1e-3, "save_checkpoint": False},
+            "train": {
+                "steps": 0,
+                "batch_size": 1,
+                "lr": 1e-3,
+                "da3_lr": 1e-5,
+                "da3_depth_head_lr": 2e-5,
+                "save_checkpoint": False,
+            },
         }
     )
     captured = {}
@@ -955,12 +1032,16 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
         eval_visualization_limit=4,
         min_lr=1.0e-8,
         warmup_steps=4000,
+        da3_lr=None,
+        da3_depth_head_lr=None,
     ):
         captured["wandb_logger"] = wandb_logger
         captured["save_eval_visualizations"] = save_eval_visualizations
         captured["eval_visualization_limit"] = eval_visualization_limit
         captured["min_lr"] = min_lr
         captured["warmup_steps"] = warmup_steps
+        captured["da3_lr"] = da3_lr
+        captured["da3_depth_head_lr"] = da3_depth_head_lr
         return [{"loss": 0.0}]
 
     monkeypatch.setattr("rtgs.main.build_rtgs_dataset", fake_dataset)
@@ -985,6 +1066,8 @@ def test_train_smoke_uses_train_stage_bounded_target_sampling(monkeypatch) -> No
     assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
     assert captured["min_lr"] == cfg.train.min_lr
     assert captured["warmup_steps"] == cfg.train.warmup_steps
+    assert captured["da3_lr"] == cfg.train.da3_lr
+    assert captured["da3_depth_head_lr"] == cfg.train.da3_depth_head_lr
 
 
 def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatch) -> None:
@@ -1030,6 +1113,8 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
         eval_visualization_limit=4,
         min_lr=1.0e-8,
         warmup_steps=4000,
+        da3_lr=None,
+        da3_depth_head_lr=None,
     ):
         captured.update(
             {
@@ -1043,6 +1128,8 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
                 "eval_visualization_limit": eval_visualization_limit,
                 "min_lr": min_lr,
                 "warmup_steps": warmup_steps,
+                "da3_lr": da3_lr,
+                "da3_depth_head_lr": da3_depth_head_lr,
             }
         )
         return [{"loss": 0.0, "eval_psnr": 1.0}]
@@ -1064,6 +1151,8 @@ def test_train_smoke_builds_indexed_eval_loader_when_path_is_provided(monkeypatc
     assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
     assert captured["min_lr"] == cfg.train.min_lr
     assert captured["warmup_steps"] == cfg.train.warmup_steps
+    assert captured["da3_lr"] == cfg.train.da3_lr
+    assert captured["da3_depth_head_lr"] == cfg.train.da3_depth_head_lr
 
 
 def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
@@ -1109,12 +1198,16 @@ def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
         eval_visualization_limit=4,
         min_lr=1.0e-8,
         warmup_steps=4000,
+        da3_lr=None,
+        da3_depth_head_lr=None,
     ):
         captured["wandb_logger"] = wandb_logger
         captured["save_eval_visualizations"] = save_eval_visualizations
         captured["eval_visualization_limit"] = eval_visualization_limit
         captured["min_lr"] = min_lr
         captured["warmup_steps"] = warmup_steps
+        captured["da3_lr"] = da3_lr
+        captured["da3_depth_head_lr"] = da3_depth_head_lr
         return [{"loss": 0.0}]
 
     monkeypatch.setattr("rtgs.main.build_rtgs_dataset", lambda root_cfg, stage, use_evaluation_index=False: ["dataset"])
@@ -1133,4 +1226,6 @@ def test_train_smoke_initializes_wandb_logger_when_enabled(monkeypatch) -> None:
     assert captured["eval_visualization_limit"] == cfg.eval.save_rendering_limit
     assert captured["min_lr"] == cfg.train.min_lr
     assert captured["warmup_steps"] == cfg.train.warmup_steps
+    assert captured["da3_lr"] == cfg.train.da3_lr
+    assert captured["da3_depth_head_lr"] == cfg.train.da3_depth_head_lr
     assert fake_run.finished is True
